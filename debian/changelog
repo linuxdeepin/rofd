@@ -1,4 +1,4 @@
-rofd (0.4.2-1) unstable; urgency=medium
+rofd (0.4.2) unstable; urgency=medium
 
   * chore: Update version to 0.4.2-1
   * chore(build): vendor all crates for offline intranet builds
