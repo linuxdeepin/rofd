@@ -122,9 +122,25 @@ fn trans_flag_defaults_false_and_accepts_xml_schema_boolean_spellings() {
 }
 
 #[test]
+fn empty_clips_element_is_tolerated_in_lenient_mode() {
+    // Invoice generators emit empty <Clips/> elements; lenient mode treats
+    // them as absent rather than rejecting the whole page.
+    let page = open_page(&path_with_clips("<ofd:Clips/>", "M 0 0")).unwrap();
+    assert_eq!(path_object(&page).clips().len(), 0);
+}
+
+#[test]
+fn empty_clips_element_is_rejected_in_strict_mode() {
+    let error = open_page_strict(&path_with_clips("<ofd:Clips/>", "M 0 0")).unwrap_err();
+    assert!(matches!(
+        error,
+        Error::InvalidStructure { ref message, .. } if message.contains("Clips must contain at least one Clip")
+    ), "got {error:?}");
+}
+
+#[test]
 fn rejects_missing_or_ambiguous_clip_structure() {
     let cases = [
-        ("<ofd:Clips/>", "Clips must contain at least one Clip"),
         (
             "<ofd:Clips><ofd:Clip/></ofd:Clips>",
             "Clip must contain at least one Area",

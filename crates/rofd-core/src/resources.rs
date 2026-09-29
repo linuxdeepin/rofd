@@ -345,6 +345,12 @@ impl ResourceCatalog {
                     message: "resource catalog declares duplicate Fonts elements".to_owned(),
                 });
             }
+            if strictness == crate::Strictness::Strict && root.multi_medias.len() > 1 {
+                return Err(Error::InvalidStructure {
+                    path: path.as_str().to_owned(),
+                    message: "resource catalog declares duplicate MultiMedias elements".to_owned(),
+                });
+            }
             for font in root.fonts.into_iter().flat_map(|fonts| fonts.entries) {
                 catalog.insert_font(font, &root.base_loc, path)?;
             }

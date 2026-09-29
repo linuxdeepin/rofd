@@ -548,3 +548,45 @@ fn duplicate_fonts_blocks_are_rejected_in_strict_mode() {
         Err(Error::InvalidStructure { .. })
     ));
 }
+
+const DUPLICATE_MULTI_MEDIAS_CATALOG: &[u8] = br#"<ofd:Res xmlns:ofd="http://www.ofdspec.org/2016">
+  <ofd:MultiMedias><ofd:MultiMedia ID="1" Type="Image" Format="PNG"><ofd:MediaFile>x.png</ofd:MediaFile></ofd:MultiMedia></ofd:MultiMedias>
+  <ofd:MultiMedias><ofd:MultiMedia ID="2" Type="Image" Format="PNG"><ofd:MediaFile>y.png</ofd:MediaFile></ofd:MultiMedia></ofd:MultiMedias>
+</ofd:Res>"#;
+
+const FAKE_PNG: &[u8] = b"\x89PNG\r\n\x1a\nfake";
+
+#[test]
+fn duplicate_multi_medias_blocks_are_merged_in_lenient_mode() {
+    // Invoice generators emit several MultiMedias blocks in one catalog.
+    let document = open(
+        "<ofd:PublicRes>Res/DupMedia.xml</ofd:PublicRes>",
+        &[
+            ("Doc_0/Res/DupMedia.xml", DUPLICATE_MULTI_MEDIAS_CATALOG),
+            ("Doc_0/Res/x.png", FAKE_PNG),
+            ("Doc_0/Res/y.png", FAKE_PNG),
+        ],
+    );
+    assert!(document.image_resource(1).is_ok());
+    assert!(document.image_resource(2).is_ok());
+}
+
+#[test]
+fn duplicate_multi_medias_blocks_are_rejected_in_strict_mode() {
+    let bytes = package(
+        "<ofd:PublicRes>Res/DupMedia.xml</ofd:PublicRes>",
+        &[("Doc_0/Res/DupMedia.xml", DUPLICATE_MULTI_MEDIAS_CATALOG)],
+    );
+    let document = Document::from_bytes(
+        bytes,
+        LoadOptions {
+            strictness: rofd_core::Strictness::Strict,
+            ..LoadOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        document.image_resource(1),
+        Err(Error::InvalidStructure { .. })
+    ));
+}
