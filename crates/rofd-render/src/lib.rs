@@ -270,6 +270,11 @@ pub enum Error {
         path: String,
     },
     /// The byte signature does not agree with the catalog's declared image format.
+    ///
+    /// Retained for public-API stability: the preflight stage no longer
+    /// constructs this variant (signature-detected formats are authoritative
+    /// for decoding), but the FFI error mapping and potential downstream
+    /// matches still reference it.
     #[error(
         "image resource {resource_id} at {path} declares {declared:?} but contains {detected:?}"
     )]

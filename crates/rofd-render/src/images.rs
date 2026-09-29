@@ -124,6 +124,9 @@ enum DecodeFailure {
         resource_id: u64,
         path: String,
     },
+    /// Dead in production since preflight stopped enforcing the declared
+    /// format; kept so `from_error`/`into_error` still cover the public
+    /// [`Error::ImageFormatMismatch`] variant losslessly.
     FormatMismatch {
         resource_id: u64,
         path: String,
@@ -522,14 +525,9 @@ fn preflight(resource: &ImageResource, limits: &ResourceLimits) -> Result<Source
         limits.max_encoded_image_bytes,
     )?;
     let detected = detect_format(resource)?;
-    if detected != resource.format() {
-        return Err(Error::ImageFormatMismatch {
-            resource_id: resource.id(),
-            path: resource.asset_path().to_owned(),
-            declared: resource.format(),
-            detected,
-        });
-    }
+    // The catalog's declared format is unreliable metadata from real-world
+    // producers (invoice generators declaring PNG for JPEG data); the byte
+    // signature is authoritative, so decoding always follows `detected`.
     if detected == ImageFormat::Jbig2 {
         if cfg!(feature = "jbig2") {
             // Page dimensions only exist after decoding, so validation
@@ -575,6 +573,11 @@ fn detect_format(resource: &ImageResource) -> Result<ImageFormat> {
         return Ok(ImageFormat::Gif);
     }
     if bytes.starts_with(b"II\x2a\x00") || bytes.starts_with(b"MM\x00\x2a") {
+        return Ok(ImageFormat::Tiff);
+    }
+    // Real-world producers occasionally declare classic TIFF for BigTIFF
+    // data; both signatures decode through the `image` crate's TIFF reader.
+    if bytes.starts_with(b"II\x2b\x00") || bytes.starts_with(b"MM\x00\x2b") {
         return Ok(ImageFormat::Tiff);
     }
     if bytes.starts_with(b"\x97JB2\r\n\x1a\n") {

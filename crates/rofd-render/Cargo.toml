@@ -27,3 +27,4 @@ pkg-config.workspace = true
 
 [dev-dependencies]
 zip = { workspace = true, features = ["deflate"] }
+tiff = { workspace = true }

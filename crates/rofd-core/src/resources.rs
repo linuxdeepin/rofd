@@ -164,7 +164,12 @@ impl ImageResource {
         self.id
     }
 
-    /// Returns the declared and supported encoded image format.
+    /// Returns the declared encoded image format.
+    ///
+    /// This is catalog metadata only: real-world producers may misdeclare
+    /// formats, so decoding follows the signature-detected format (see
+    /// `rofd_render`'s `detect_format`), and `rofd-render` also consults the
+    /// declared value as a heuristic for JBIG2 diagnostic handling.
     pub fn format(&self) -> ImageFormat {
         self.format
     }
@@ -343,6 +348,12 @@ impl ResourceCatalog {
                 return Err(Error::InvalidStructure {
                     path: path.as_str().to_owned(),
                     message: "resource catalog declares duplicate Fonts elements".to_owned(),
+                });
+            }
+            if strictness == crate::Strictness::Strict && root.multi_medias.len() > 1 {
+                return Err(Error::InvalidStructure {
+                    path: path.as_str().to_owned(),
+                    message: "resource catalog declares duplicate MultiMedias elements".to_owned(),
                 });
             }
             for font in root.fonts.into_iter().flat_map(|fonts| fonts.entries) {

@@ -1517,10 +1517,15 @@ impl ConversionContext<'_> {
             return Ok(Vec::new());
         };
         if clips.clips.is_empty() {
-            return Err(Error::InvalidStructure {
-                path: self.path.to_owned(),
-                message: "Clips must contain at least one Clip".to_owned(),
-            });
+            // Invoice generators emit empty <Clips/> elements; in lenient mode
+            // treat them as absent instead of rejecting the whole page.
+            if self.document.strictness() == crate::Strictness::Strict {
+                return Err(Error::InvalidStructure {
+                    path: self.path.to_owned(),
+                    message: "Clips must contain at least one Clip".to_owned(),
+                });
+            }
+            return Ok(Vec::new());
         }
         let affected_by_object_transform = parse_object_bool(
             clips.trans_flag.as_deref(),
