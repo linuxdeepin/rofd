@@ -2,7 +2,7 @@ use std::io::{Cursor, Write};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use rofd_core::{Document, ImageFormat, LoadOptions, ResourceLimits};
+use rofd_core::{Document, LoadOptions, ResourceLimits};
 use rofd_render::{Error, ImageDecoder};
 use zip::{write::SimpleFileOptions, ZipWriter};
 
@@ -152,25 +152,14 @@ fn lossless_formats_decode_in_source_orientation_with_opaque_rgba_channels() {
 }
 
 #[test]
-fn magic_is_required_and_must_match_the_declared_format() {
-    assert!(matches!(
-        decode(PNG, "JPEG"),
-        Err(Error::ImageFormatMismatch {
-            resource_id: 10,
-            declared: ImageFormat::Jpeg,
-            detected: ImageFormat::Png,
-            ..
-        })
-    ));
-    assert!(matches!(
-        decode(JPEG, "PNG"),
-        Err(Error::ImageFormatMismatch {
-            resource_id: 10,
-            declared: ImageFormat::Png,
-            detected: ImageFormat::Jpeg,
-            ..
-        })
-    ));
+fn magic_is_required_and_overrides_the_declared_format() {
+    // Real-world producers misdeclare formats (invoices declaring PNG for
+    // JPEG data); the byte signature is authoritative when the two disagree.
+    let png_declared_jpeg = decode(PNG, "JPEG").unwrap();
+    assert_eq!(png_declared_jpeg.resource_id(), 10);
+    assert_eq!(png_declared_jpeg.dimensions(), (3, 2));
+    let jpeg_declared_png = decode(JPEG, "PNG").unwrap();
+    assert_eq!(jpeg_declared_png.dimensions(), (3, 2));
     assert!(matches!(
         decode(b"WEBP-not-supported", "PNG"),
         Err(Error::UnsupportedImageFormat {

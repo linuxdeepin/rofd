@@ -109,8 +109,10 @@ pub(crate) struct ResourceRoot {
     /// ano.ofd); every block contributes entries to the catalog.
     #[serde(rename = "Fonts", default)]
     pub(crate) fonts: Vec<Fonts>,
-    #[serde(rename = "MultiMedias")]
-    pub(crate) multi_medias: Option<MultiMedias>,
+    /// Real-world producers occasionally emit several MultiMedias blocks
+    /// (invoice generators); every block contributes entries to the catalog.
+    #[serde(rename = "MultiMedias", default)]
+    pub(crate) multi_medias: Vec<MultiMedias>,
     #[serde(rename = "DrawParams")]
     pub(crate) draw_params: Option<DrawParams>,
     #[serde(rename = "ColorSpaces")]

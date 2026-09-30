@@ -522,14 +522,9 @@ fn preflight(resource: &ImageResource, limits: &ResourceLimits) -> Result<Source
         limits.max_encoded_image_bytes,
     )?;
     let detected = detect_format(resource)?;
-    if detected != resource.format() {
-        return Err(Error::ImageFormatMismatch {
-            resource_id: resource.id(),
-            path: resource.asset_path().to_owned(),
-            declared: resource.format(),
-            detected,
-        });
-    }
+    // The catalog's declared format is unreliable metadata from real-world
+    // producers (invoice generators declaring PNG for JPEG data); the byte
+    // signature is authoritative, so decoding always follows `detected`.
     if detected == ImageFormat::Jbig2 {
         if cfg!(feature = "jbig2") {
             // Page dimensions only exist after decoding, so validation
