@@ -997,7 +997,14 @@ fn text_geometry_and_search_rectangles_use_font_advances() {
             (ab - 2.432).abs() < 1e-3 && (bz - 2.628).abs() < 1e-3,
             "advances {ab} and {bz}"
         );
-        assert!(a.rect_mm.width_mm >= 4.0, "geometry stays conservative");
+        // A resolved advance is the box width, so the boxes tile the run: a match
+        // rectangle then hugs the matched text instead of overhanging it.
+        assert!(
+            (a.rect_mm.width_mm - 2.432).abs() < 1e-3,
+            "width {}",
+            a.rect_mm.width_mm
+        );
+        assert!((a.rect_mm.x_mm + a.rect_mm.width_mm - b.rect_mm.x_mm).abs() < 1e-9);
 
         // Search rectangles come from the same geometry.
         let query = CString::new("BZ").unwrap();

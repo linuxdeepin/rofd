@@ -568,15 +568,15 @@ impl<'a> TextBuilder<'a> {
         for run in object.runs() {
             let (mut x, mut y) = (run.x(), run.y());
             for (index, character) in run.text().chars().enumerate() {
+                let font_advance = resolved
+                    .as_ref()
+                    .and_then(|values| values.get(scalar))
+                    .copied()
+                    .filter(|value| value.is_finite() && *value > 0.0);
                 let dx = if run.has_explicit_delta_x() {
                     run.delta_x()[index]
                 } else {
-                    resolved
-                        .as_ref()
-                        .and_then(|values| values.get(scalar))
-                        .copied()
-                        .filter(|value| value.is_finite() && *value >= 0.0)
-                        .unwrap_or(size)
+                    font_advance.unwrap_or(size)
                 };
                 scalar += 1;
                 let dy = if run.has_explicit_delta_y() {
@@ -586,11 +586,16 @@ impl<'a> TextBuilder<'a> {
                 };
                 let next_x = finite_add(x, dx)?;
                 let next_y = finite_add(y, dy)?;
-                // Bound the horizontal baseline sweep with a direction-independent
-                // font-size footprint. Explicit zero advances still receive
+                // A resolved glyph advance is the box width, so the boxes of a run
+                // tile it and a match rectangle hugs the matched text. Without one,
+                // bound the horizontal baseline sweep with a direction-independent
+                // font-size footprint instead; explicit zero advances still receive
                 // nonempty conservative geometry.
                 let left = x.min(next_x);
-                let right = finite_add(left, dx.abs().max(size))?;
+                let right = finite_add(
+                    left,
+                    font_advance.map_or_else(|| dx.abs().max(size), f64::abs),
+                )?;
                 let top = finite_add(y.min(next_y), -size)?;
                 let bottom = y.max(next_y);
                 let rect = transformed_box(left, top, right, bottom, transform)?;

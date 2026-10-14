@@ -476,8 +476,12 @@ fn advance_provider_supplies_scalar_steps_where_deltas_are_absent() {
     assert_eq!(without[1].rect_mm().unwrap().x - first.x, 4.0);
     assert_eq!(with[1].rect_mm().unwrap().x - first.x, 2.0);
     assert_eq!(with[3].rect_mm().unwrap().x - first.x, 6.0);
-    // The footprint stays conservative: every box is at least Size wide.
-    assert!(with[3].rect_mm().unwrap().width >= 4.0);
+    // A resolved advance is the box width (so the boxes tile the run), while an
+    // unresolved scalar keeps the conservative font-size footprint.
+    assert!((with[3].rect_mm().unwrap().width - 2.0).abs() < 1e-9);
+    assert!(without[3].rect_mm().unwrap().width >= 4.0);
+    let first_end = with[0].rect_mm().unwrap().x + with[0].rect_mm().unwrap().width;
+    assert!((first_end - with[1].rect_mm().unwrap().x).abs() < 1e-9);
 
     // A provider that cannot resolve a font leaves the font-size footprint alone.
     let failed = document_with_page_and_advances(
