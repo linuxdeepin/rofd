@@ -16,6 +16,7 @@ use rofd_render::{
 use std::ffi::CStr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
+use std::sync::OnceLock;
 
 const MAX_FALLBACK_FAMILIES: usize = 1024;
 const DEFAULT_FALLBACK_FAMILIES: [&str; 3] = ["Noto Sans CJK SC", "Noto Sans", "DejaVu Sans"];
@@ -128,6 +129,25 @@ fn default_fallback_families() -> Vec<String> {
         .into_iter()
         .map(str::to_owned)
         .collect()
+}
+
+/// Font advances for text runs that carry no explicit `DeltaX`.
+///
+/// Semantic page geometry is resolved with the same font stack a default renderer
+/// uses (`rofd_renderer_new` with NULL options), so the page text layout, search
+/// rectangles and selection regions land on the glyphs that get drawn. The resolver
+/// is created once per process and kept for the life of the library, because the
+/// system font database scan is the expensive part. A renderer created with other
+/// fallback families still chooses its own faces for drawing.
+pub(crate) fn text_advance_provider() -> rofd_render::FontTextAdvances<'static> {
+    static RESOLVER: OnceLock<&'static SystemFontResolver> = OnceLock::new();
+    let resolver = RESOLVER.get_or_init(|| {
+        Box::leak(Box::new(SystemFontResolver::with_system_fonts(
+            default_fallback_families(),
+            64 * 1024 * 1024,
+        )))
+    });
+    rofd_render::FontTextAdvances::new(*resolver)
 }
 
 pub(crate) struct RenderOptionsInput;

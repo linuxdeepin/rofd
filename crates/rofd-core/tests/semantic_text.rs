@@ -1,8 +1,10 @@
 mod support;
 
+use std::sync::Arc;
+
 use rofd_core::{
     Document, Error, FindOptions, LoadOptions, Rect, ResourceLimits, SelectionStyle, TextCharFlags,
-    TextGeometryPrecision, TextSelection,
+    TextGeometryPrecision, TextObject, TextSelection,
 };
 
 fn rect(x: f64, y: f64, width: f64, height: f64) -> Rect {
@@ -394,6 +396,129 @@ fn page_with_text(content: &str) -> rofd_core::Page {
 </ofd:Page>"#
     );
     document_with_page(&page_xml, "", "", &[]).page(0).unwrap()
+}
+
+/// A provider that advances every scalar by half the font size, so the geometry it
+/// produces is distinguishable from both the font-size footprint and explicit deltas.
+struct HalfSizeAdvances {
+    resolution_failure: bool,
+}
+
+impl rofd_core::TextAdvanceProvider for HalfSizeAdvances {
+    fn advances_mm(
+        &self,
+        _page: &rofd_core::Page,
+        text: &TextObject,
+        size_mm: f64,
+    ) -> Option<Vec<f64>> {
+        if self.resolution_failure {
+            return None;
+        }
+        Some(
+            text.runs()
+                .iter()
+                .flat_map(|run| run.text().chars().map(|_| size_mm / 2.0))
+                .collect(),
+        )
+    }
+}
+
+fn document_with_page_and_advances(
+    page_xml: &str,
+    advances: Option<Arc<dyn rofd_core::TextAdvanceProvider>>,
+) -> Document {
+    let document_xml = r#"<ofd:Document xmlns:ofd="http://www.ofdspec.org/2016"><ofd:CommonData>
+<ofd:PageArea><ofd:PhysicalBox>0 0 210 297</ofd:PhysicalBox></ofd:PageArea>
+<ofd:PublicRes>Res.xml</ofd:PublicRes></ofd:CommonData>
+<ofd:Pages><ofd:Page ID="900" BaseLoc="Pages/Page_0/Content.xml"/></ofd:Pages></ofd:Document>"#;
+    let entries = [("Doc_0/Res.xml", FONT_CATALOG.as_bytes())];
+    Document::from_bytes_with_advances(
+        support::ofd_with_document_page_and_entries(document_xml, page_xml, &entries),
+        LoadOptions::default(),
+        advances,
+    )
+    .unwrap()
+}
+
+#[test]
+fn advance_provider_supplies_scalar_steps_where_deltas_are_absent() {
+    let page_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<ofd:Page xmlns:ofd="http://www.ofdspec.org/2016">
+  <ofd:Content><ofd:Layer ID="1">{}</ofd:Layer></ofd:Content>
+</ofd:Page>"#,
+        text_object(2, "ABCD")
+    );
+
+    let without = document_with_page_and_advances(&page_xml, None)
+        .page(0)
+        .unwrap()
+        .text()
+        .unwrap()
+        .characters()
+        .to_vec();
+    let with = document_with_page_and_advances(
+        &page_xml,
+        Some(Arc::new(HalfSizeAdvances {
+            resolution_failure: false,
+        })),
+    )
+    .page(0)
+    .unwrap()
+    .text()
+    .unwrap()
+    .characters()
+    .to_vec();
+
+    // The fixture places run X at 1 and uses Size 4, so the second scalar starts at
+    // 5 without a provider and at 3 with one, and the same holds for every step.
+    let first = without[0].rect_mm().unwrap();
+    assert_eq!(without[1].rect_mm().unwrap().x - first.x, 4.0);
+    assert_eq!(with[1].rect_mm().unwrap().x - first.x, 2.0);
+    assert_eq!(with[3].rect_mm().unwrap().x - first.x, 6.0);
+    // The footprint stays conservative: every box is at least Size wide.
+    assert!(with[3].rect_mm().unwrap().width >= 4.0);
+
+    // A provider that cannot resolve a font leaves the font-size footprint alone.
+    let failed = document_with_page_and_advances(
+        &page_xml,
+        Some(Arc::new(HalfSizeAdvances {
+            resolution_failure: true,
+        })),
+    )
+    .page(0)
+    .unwrap()
+    .text()
+    .unwrap()
+    .characters()
+    .to_vec();
+    assert_eq!(failed[1].rect_mm().unwrap().x - first.x, 4.0);
+}
+
+#[test]
+fn explicit_deltas_stay_authoritative_with_a_provider() {
+    let page_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<ofd:Page xmlns:ofd="http://www.ofdspec.org/2016">
+  <ofd:Content><ofd:Layer ID="1">{}</ofd:Layer></ofd:Content>
+</ofd:Page>"#,
+        r#"<ofd:TextObject ID="2" Boundary="0 0 20 8" Font="10" Size="4"><ofd:TextCode X="1" Y="5" DeltaX="9 9 9 9">ABCD</ofd:TextCode></ofd:TextObject>"#
+    );
+    let text = document_with_page_and_advances(
+        &page_xml,
+        Some(Arc::new(HalfSizeAdvances {
+            resolution_failure: false,
+        })),
+    )
+    .page(0)
+    .unwrap()
+    .text()
+    .unwrap()
+    .characters()
+    .to_vec();
+
+    let first = text[0].rect_mm().unwrap();
+    assert_eq!(text[1].rect_mm().unwrap().x - first.x, 9.0);
 }
 
 #[test]

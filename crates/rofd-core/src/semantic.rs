@@ -1,6 +1,24 @@
 use std::ops::Range;
 
-use crate::{Error, PageObject, Point, Rect, ResourceLimits, Result, TextObject, Transform};
+use crate::{Error, Page, PageObject, Point, Rect, Result, TextObject, Transform};
+
+/// Supplies the horizontal advance of one scalar when a text run declares no
+/// `DeltaX` for it.
+///
+/// The OFD text model positions such a scalar by its font's advance, so geometry
+/// that resolves fonts matches what a renderer draws; this crate parses and indexes
+/// text without font access, which is why a provider is injected from outside
+/// (`rofd-render` implements it over the same font stack the renderer uses). A
+/// document loaded without a provider keeps the font-size footprint for those runs,
+/// which stays a valid conservative approximation.
+pub trait TextAdvanceProvider: Send + Sync {
+    /// Returns one advance in millimetres per scalar of `text`, concatenating its
+    /// runs in order, or `None` when the object's font cannot be resolved (the
+    /// builder then keeps the font-size footprint).
+    ///
+    /// Non-finite or negative values are ignored per scalar.
+    fn advances_mm(&self, page: &Page, text: &TextObject, size_mm: f64) -> Option<Vec<f64>>;
+}
 
 /// Options for literal search in canonical page text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -462,8 +480,11 @@ fn union_rectangles(mut rectangles: impl Iterator<Item = Rect>) -> Result<Option
     })
 }
 
-pub(crate) fn build_page_text(page: &crate::Page) -> Result<PageText> {
-    let mut builder = TextBuilder::new(page.resource_limits());
+pub(crate) fn build_page_text(
+    page: &crate::Page,
+    advances: Option<&dyn TextAdvanceProvider>,
+) -> Result<PageText> {
+    let mut builder = TextBuilder::new(page, advances);
     for layer in page.layers() {
         builder.objects(layer.objects(), Transform::IDENTITY)?;
     }
@@ -475,18 +496,23 @@ pub(crate) fn build_page_text(page: &crate::Page) -> Result<PageText> {
     Ok(builder.text)
 }
 
-struct TextBuilder {
+struct TextBuilder<'a> {
     text: PageText,
+    page: &'a Page,
+    advances: Option<&'a dyn TextAdvanceProvider>,
     source_characters: usize,
     metadata_entries: usize,
     max_source_characters: usize,
     max_metadata_entries: usize,
 }
 
-impl TextBuilder {
-    fn new(limits: &ResourceLimits) -> Self {
+impl<'a> TextBuilder<'a> {
+    fn new(page: &'a Page, advances: Option<&'a dyn TextAdvanceProvider>) -> Self {
+        let limits = page.resource_limits();
         Self {
             text: PageText::default(),
+            page,
+            advances,
             source_characters: 0,
             metadata_entries: 0,
             max_source_characters: limits.max_text_characters_per_page,
@@ -526,14 +552,33 @@ impl TextBuilder {
             self.push_separator()?;
         }
         let size = object.font_size();
+        // One font-resolved advance per scalar of the whole object, in run order;
+        // absent when the provider has no font for it. Explicit deltas stay
+        // authoritative and are never replaced, and they are the only thing this
+        // geometry takes from the provider, so an object whose runs all declare their
+        // own deltas never asks it for a font at all.
+        let needs_advances = object.runs().iter().any(|run| !run.has_explicit_delta_x());
+        let resolved = if needs_advances {
+            self.advances
+                .and_then(|advances| advances.advances_mm(self.page, object, size))
+        } else {
+            None
+        };
+        let mut scalar = 0usize;
         for run in object.runs() {
             let (mut x, mut y) = (run.x(), run.y());
             for (index, character) in run.text().chars().enumerate() {
                 let dx = if run.has_explicit_delta_x() {
                     run.delta_x()[index]
                 } else {
-                    size
+                    resolved
+                        .as_ref()
+                        .and_then(|values| values.get(scalar))
+                        .copied()
+                        .filter(|value| value.is_finite() && *value >= 0.0)
+                        .unwrap_or(size)
                 };
+                scalar += 1;
                 let dy = if run.has_explicit_delta_y() {
                     run.delta_y()[index]
                 } else {

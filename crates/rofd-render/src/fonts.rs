@@ -4,7 +4,10 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use fontdb::{Database, Family, Query, Source, ID};
 use freetype::face::LoadFlag;
-use rofd_core::{FontResource, ResourceIdentity, ResourceLimits, TextObject, Transform};
+use rofd_core::{
+    FontResource, Page, ResourceIdentity, ResourceLimits, TextAdvanceProvider, TextObject,
+    Transform,
+};
 
 use crate::{Error, Result};
 
@@ -413,6 +416,7 @@ pub struct PositionedGlyph {
     glyph_id: u32,
     x: f64,
     y: f64,
+    advance: (f64, f64),
     character: Option<char>,
     source_range: Range<usize>,
     scalar_index: usize,
@@ -434,6 +438,15 @@ impl PositionedGlyph {
     /// Returns the y coordinate in OFD object-space millimetres.
     pub fn y(&self) -> f64 {
         self.y
+    }
+    /// Returns the advance this glyph contributes on each axis, in millimetres.
+    ///
+    /// This is the selected face advance, or the font size when no face was
+    /// available. It is what positions the next glyph, so a caller that needs the
+    /// per-scalar geometry of a run without explicit deltas can sum it instead of
+    /// resolving fonts again.
+    pub fn advance(&self) -> (f64, f64) {
+        self.advance
     }
     /// Returns the associated source scalar, or `None` for an extra mapped glyph.
     pub fn character(&self) -> Option<char> {
@@ -1111,10 +1124,12 @@ pub fn position_glyph_runs(
                         let (offset_x, offset_y) = glyph_transform
                             .map(|t| (t.x(), t.y()))
                             .unwrap_or((0.0, 0.0));
+                        let advance = selected.advance_mm(glyph_id, text.font_size())?;
                         glyphs.push(PositionedGlyph {
                             glyph_id,
                             x: finite_coordinate(text, "glyph x", x + inferred_x + offset_x)?,
                             y: finite_coordinate(text, "glyph y", y + inferred_y + offset_y)?,
+                            advance,
                             character,
                             source_range: start_byte..end_byte,
                             scalar_index,
@@ -1123,7 +1138,6 @@ pub fn position_glyph_runs(
                             font_source: selected.source().clone(),
                             transform: glyph_transform.and_then(|t| t.matrix()),
                         });
-                        let advance = selected.advance_mm(glyph_id, text.font_size())?;
                         inferred_x = finite_coordinate(text, "advance x", inferred_x + advance.0)?;
                         inferred_y = finite_coordinate(text, "advance y", inferred_y + advance.1)?;
                     }
@@ -1183,10 +1197,17 @@ pub fn position_glyph_runs(
                 &requested,
                 &mut diagnostics,
             )?;
+            let advance = selection
+                .font
+                .as_ref()
+                .map(|font| font.advance_mm(selection.glyph_id, text.font_size()))
+                .transpose()?
+                .unwrap_or((text.font_size(), 0.0));
             glyphs.push(PositionedGlyph {
                 glyph_id: selection.glyph_id,
                 x: finite_coordinate(text, "glyph x", x)?,
                 y: finite_coordinate(text, "glyph y", y)?,
+                advance,
                 character: Some(character),
                 source_range: byte_start..byte_end,
                 scalar_index,
@@ -1195,12 +1216,6 @@ pub fn position_glyph_runs(
                 font_source: selection.source,
                 transform: None,
             });
-            let advance = selection
-                .font
-                .as_ref()
-                .map(|font| font.advance_mm(selection.glyph_id, text.font_size()))
-                .transpose()?
-                .unwrap_or((text.font_size(), 0.0));
             let delta_x = if run.has_explicit_delta_x() {
                 run.delta_x()[local]
             } else {
@@ -1227,6 +1242,54 @@ pub fn position_glyph_runs(
         });
     }
     Ok(runs)
+}
+
+/// Per-scalar advances from the same font resolution the renderer positions text with.
+///
+/// This is the [`TextAdvanceProvider`] rofd-core asks for when a text run carries no
+/// explicit `DeltaX`: the answer is the advance of the glyph the positioner selected,
+/// summed per scalar for structured `Glyphs` mappings, so page geometry matches the
+/// rendered glyphs. Resolution failures answer `None`, which keeps rofd-core's
+/// font-size footprint.
+#[derive(Clone, Copy)]
+pub struct FontTextAdvances<'a> {
+    resolver: &'a dyn FontResolver,
+}
+
+impl<'a> FontTextAdvances<'a> {
+    /// Wraps the resolver a renderer would use for the same page.
+    pub fn new(resolver: &'a dyn FontResolver) -> Self {
+        Self { resolver }
+    }
+}
+
+impl TextAdvanceProvider for FontTextAdvances<'_> {
+    fn advances_mm(&self, page: &Page, text: &TextObject, size_mm: f64) -> Option<Vec<f64>> {
+        let resource = page.font_resource(text.font_id()).ok()?;
+        let runs =
+            position_glyph_runs(self.resolver, &resource, text, page.resource_limits()).ok()?;
+        let total = text.runs().iter().try_fold(0usize, |total, run| {
+            total.checked_add(run.text().chars().count())
+        })?;
+        // Glyphs of one structured mapping share the scalar index of the mapped
+        // range, so their advances sum there, exactly as the positioner advances the
+        // mapped run. A scalar without a glyph keeps the size footprint the builder
+        // uses on its own.
+        let mut advances: Vec<Option<f64>> = vec![None; total];
+        for run in &runs {
+            for glyph in run.glyphs() {
+                let slot = advances.get_mut(glyph.scalar_index())?;
+                let (x, _) = glyph.advance();
+                *slot = Some(slot.unwrap_or(0.0) + x);
+            }
+        }
+        Some(
+            advances
+                .into_iter()
+                .map(|advance| advance.unwrap_or(size_mm))
+                .collect(),
+        )
+    }
 }
 
 fn select_character(

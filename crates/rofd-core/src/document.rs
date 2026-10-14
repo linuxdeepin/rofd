@@ -123,6 +123,19 @@ struct DocumentInner {
     bookmarks: OnceLock<crate::navigation::BookmarkData>,
     bookmark_initialization: Mutex<()>,
     navigation_warning_state: Mutex<NavigationWarningState>,
+    /// Font-resolved per-scalar advances for runs without explicit deltas, when the
+    /// loader supplied a provider (see [`crate::TextAdvanceProvider`]).
+    text_advances: Option<TextAdvances>,
+}
+
+/// Debug-friendly owner of the optional text advance provider.
+#[derive(Clone)]
+struct TextAdvances(Arc<dyn crate::TextAdvanceProvider>);
+
+impl std::fmt::Debug for TextAdvances {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TextAdvances(<provider>)")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -233,10 +246,11 @@ impl Page {
     /// physical-page millimetres, in effective paint order.
     ///
     /// Visible annotation appearances follow the page layers. Distinct nonempty
-    /// text objects are separated by synthesized newlines. Geometry uses only
-    /// validated OFD positioning and font size, without font lookup or shaping.
-    /// The complete result is cached and shared by cloned page handles. Failed
-    /// builds are not cached and may be retried on a later call.
+    /// text objects are separated by synthesized newlines. Geometry uses validated
+    /// OFD positioning; a scalar whose run declares no `DeltaX` uses the advance of a
+    /// provider's font when the document was loaded with one, and the font size
+    /// otherwise. The complete result is cached and shared by cloned page handles.
+    /// Failed builds are not cached and may be retried on a later call.
     pub fn text(&self) -> crate::Result<&crate::PageText> {
         if let Some(text) = self.data.semantic_text.get() {
             return Ok(text);
@@ -247,7 +261,12 @@ impl Page {
         if let Some(text) = self.data.semantic_text.get() {
             return Ok(text);
         }
-        let text = crate::semantic::build_page_text(self)?;
+        let advances = self
+            ._document
+            .text_advances
+            .as_ref()
+            .map(|advances| advances.0.as_ref() as &dyn crate::TextAdvanceProvider);
+        let text = crate::semantic::build_page_text(self, advances)?;
         Ok(self.data.semantic_text.get_or_init(|| text))
     }
 
@@ -339,16 +358,40 @@ impl Page {
 impl Document {
     /// Opens an OFD document from a host file path.
     pub fn open(path: impl AsRef<Path>, options: LoadOptions) -> Result<Self> {
+        Self::open_with_advances(path, options, None)
+    }
+
+    /// Opens an OFD document from a host file path, resolving text advances through
+    /// `advances`.
+    pub fn open_with_advances(
+        path: impl AsRef<Path>,
+        options: LoadOptions,
+        advances: Option<Arc<dyn crate::TextAdvanceProvider>>,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let bytes = fs::read(path).map_err(|source| Error::Io {
             path: path.to_owned(),
             source,
         })?;
-        Self::from_bytes(bytes, options)
+        Self::from_bytes_with_advances(bytes, options, advances)
     }
 
     /// Opens an OFD document from owned bytes.
     pub fn from_bytes(bytes: Vec<u8>, options: LoadOptions) -> Result<Self> {
+        Self::from_bytes_with_advances(bytes, options, None)
+    }
+
+    /// Opens an OFD document from owned bytes, resolving text advances through
+    /// `advances`.
+    ///
+    /// Without a provider, runs that carry no explicit `DeltaX` keep the font-size
+    /// footprint; with one they use the font's advances, which is what a renderer
+    /// draws.
+    pub fn from_bytes_with_advances(
+        bytes: Vec<u8>,
+        options: LoadOptions,
+        advances: Option<Arc<dyn crate::TextAdvanceProvider>>,
+    ) -> Result<Self> {
         let strictness = options.strictness;
         let limits = options.limits;
         let container = Container::from_bytes(bytes, limits.clone())?;
@@ -491,6 +534,7 @@ impl Document {
             container,
             document_path,
             limits,
+            text_advances: advances.map(TextAdvances),
             metadata: Metadata {
                 document_id: info.document_id,
                 title: info.title,

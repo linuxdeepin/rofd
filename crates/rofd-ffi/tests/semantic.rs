@@ -45,6 +45,50 @@ fn page_with_layer(layer: &str) -> *mut rofd_page_t {
     }
 }
 
+/// A page whose text object references an embedded subset font and declares no
+/// `DeltaX`, so its geometry can only come from the font's advances.
+fn page_with_embedded_font() -> *mut rofd_page_t {
+    const LATIN_FONT: &[u8] =
+        include_bytes!("../../rofd-render/tests/fixtures/fonts/phase3-latin-subset.ttf");
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    // Most Latin scalars in this subset are full-width, so A/B/Z are the ones that
+    // tell a font advance apart from the font-size footprint.
+    let xml = r#"<ofd:Page xmlns:ofd="http://www.ofdspec.org/2016"><ofd:Content><ofd:Layer ID="1"><ofd:TextObject ID="2" Boundary="0 0 30 10" Font="10" Size="4"><ofd:TextCode X="1" Y="4">ABZ</ofd:TextCode></ofd:TextObject></ofd:Layer></ofd:Content></ofd:Page>"#;
+    let document = r#"<ofd:Document xmlns:ofd="http://www.ofdspec.org/2016"><ofd:CommonData><ofd:PageArea><ofd:PhysicalBox>0 0 210 297</ofd:PhysicalBox></ofd:PageArea><ofd:DocumentRes>Res.xml</ofd:DocumentRes></ofd:CommonData><ofd:Pages><ofd:Page ID="900" BaseLoc="Pages/Page_0/Content.xml"/></ofd:Pages></ofd:Document>"#;
+    let font = br#"<ofd:Res xmlns:ofd="http://www.ofdspec.org/2016"><ofd:Fonts><ofd:Font ID="10" FontName="Fixture"><ofd:FontFile>Fonts/latin.ttf</ofd:FontFile></ofd:Font></ofd:Fonts></ofd:Res>"#;
+    let bytes = support::ofd_with_document_page_and_entries(
+        document,
+        xml,
+        &[
+            ("Doc_0/Res.xml", font),
+            ("Doc_0/Fonts/latin.ttf", LATIN_FONT),
+        ],
+    );
+    let path = std::env::temp_dir().join(format!(
+        "rofd-ffi-semantic-font-{}-{}.ofd",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, bytes).unwrap();
+    let cpath = CString::new(path.to_str().unwrap()).unwrap();
+    // SAFETY: All input and output storage is valid and distinct; document is freed once.
+    unsafe {
+        let mut document = ptr::null_mut();
+        let mut page = ptr::null_mut();
+        assert_eq!(
+            rofd_document_open(cpath.as_ptr(), ptr::null(), &mut document, ptr::null_mut()),
+            ROFD_STATUS_OK
+        );
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            rofd_document_get_page(document, 0, &mut page, ptr::null_mut()),
+            ROFD_STATUS_OK
+        );
+        rofd_document_free(document);
+        page
+    }
+}
+
 fn page(two_objects: bool) -> *mut rofd_page_t {
     let tail = if two_objects {
         r#"<ofd:TextObject ID="3" Boundary="10 35 30 8" Font="10" Size="4"><ofd:TextCode X="1" Y="5">尾</ofd:TextCode></ofd:TextObject>"#
@@ -918,6 +962,55 @@ fn search_and_selection_accessors_are_transactional() {
         assert_eq!(alias, sentinel);
 
         rofd_text_selection_free(selection);
+        rofd_page_free(page);
+    }
+}
+
+/// Page geometry and search rectangles resolve the advances of the font a renderer
+/// would use, instead of the font-size footprint, so they land on the drawn glyphs.
+#[test]
+fn text_geometry_and_search_rectangles_use_font_advances() {
+    // SAFETY: Every handle is live for its accesses and freed once after all borrows.
+    unsafe {
+        let page = page_with_embedded_font();
+        let mut layout = ptr::null_mut();
+        assert_eq!(
+            rofd_page_get_text_layout(page, &mut layout, ptr::null_mut()),
+            ROFD_STATUS_OK
+        );
+        let mut count = 0;
+        assert_eq!(
+            rofd_text_layout_get_count(layout, &mut count, ptr::null_mut()),
+            ROFD_STATUS_OK
+        );
+        assert_eq!(count, 3);
+
+        let a = character(layout, 0);
+        let b = character(layout, 1);
+        let z = character(layout, 2);
+        assert_eq!(a.rect_mm.x_mm, 1.0);
+        // The subset font's own advances: A 2.432 mm, B 2.628 mm, Z 2.412 mm at
+        // size 4. The font-size footprint would step by 4 mm each time.
+        let ab = b.rect_mm.x_mm - a.rect_mm.x_mm;
+        let bz = z.rect_mm.x_mm - b.rect_mm.x_mm;
+        assert!(
+            (ab - 2.432).abs() < 1e-3 && (bz - 2.628).abs() < 1e-3,
+            "advances {ab} and {bz}"
+        );
+        assert!(a.rect_mm.width_mm >= 4.0, "geometry stays conservative");
+
+        // Search rectangles come from the same geometry.
+        let query = CString::new("BZ").unwrap();
+        let mut search = ptr::null_mut();
+        assert_eq!(
+            rofd_page_find_text(page, query.as_ptr(), &mut search, ptr::null_mut()),
+            ROFD_STATUS_OK
+        );
+        assert_eq!(search_count(search), 1);
+        let matched = text_match(search, 0);
+        assert!((matched.rect_mm.x_mm - (1.0 + 2.432)).abs() < 1e-3);
+        rofd_text_search_free(search);
+        rofd_text_layout_free(layout);
         rofd_page_free(page);
     }
 }

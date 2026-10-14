@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 
 use fontdb::Database;
-use rofd_core::{Document, LoadOptions, PageObject, ResourceLimits};
+use rofd_core::{Document, LoadOptions, PageObject, ResourceLimits, TextAdvanceProvider};
 use rofd_render::{
     position_glyph_runs, Error, FontDiagnostic, FontIdentity, FontResolver, FontSource,
     ResolvedFont, SystemFontResolver,
@@ -852,4 +852,63 @@ fn equal_resource_ids_from_distinct_documents_do_not_share_cache_entries() {
         latin[0].glyphs()[0].glyph_id(),
         cjk[0].glyphs()[0].glyph_id()
     );
+}
+
+/// The provider rofd-core asks for must answer exactly the advances the positioner
+/// used, so page geometry lands on the glyphs a renderer draws.
+#[test]
+fn font_text_advances_match_the_positioner_and_follow_font_metrics() {
+    // A, B and Z carry proportional advances in the fixture subset; most other
+    // Latin scalars map to a full-width face advance equal to the font size, which
+    // would not distinguish metrics from the size-based fallback.
+    let document = package_named(
+        Some(LATIN_FONT),
+        r#"<ofd:TextCode X="0" Y="4">ABZ</ofd:TextCode>"#,
+        "",
+        "Fixture",
+    );
+    let text = text_object(&document);
+    let page = document.page(0).unwrap();
+    let resource = document.font_resource(text.font_id()).unwrap();
+    let mut database = Database::new();
+    database.load_font_data(LATIN_FONT.to_vec());
+    let resolver = SystemFontResolver::from_database(database, Vec::new(), 1 << 20);
+
+    let runs = position_glyph_runs(&resolver, &resource, &text, page.resource_limits()).unwrap();
+    let provider = rofd_render::FontTextAdvances::new(&resolver);
+    let advances = provider
+        .advances_mm(&page, &text, text.font_size())
+        .expect("embedded font resolves");
+
+    assert!(
+        !runs[0].glyphs()[0].is_synthetic_box(),
+        "the subset font must own these glyphs: {:?}",
+        runs[0].diagnostics()
+    );
+
+    // One advance per scalar, equal to the advance of the glyph that owns it.
+    let positioned: Vec<f64> = runs
+        .iter()
+        .flat_map(|run| run.glyphs())
+        .map(|glyph| glyph.advance().0)
+        .collect();
+    assert_eq!(advances.len(), positioned.len());
+    assert_eq!(advances.len(), 3);
+    for (index, advance) in advances.iter().enumerate() {
+        assert!(
+            (advance - positioned[index]).abs() < 1e-9,
+            "scalar {index}: provider {advance} vs positioner {}",
+            positioned[index]
+        );
+    }
+
+    // Font metrics, not a uniform font-size footprint.
+    assert!(advances[0] < advances[1], "{advances:?}");
+    assert!(advances.iter().all(|advance| *advance < text.font_size()));
+    assert!(advances.iter().all(|advance| *advance > 0.0));
+
+    // Both layers agree on where the run ends.
+    let semantic_end: f64 = advances.iter().sum();
+    let positioned_end: f64 = positioned.iter().sum();
+    assert!((semantic_end - positioned_end).abs() < 1e-9);
 }

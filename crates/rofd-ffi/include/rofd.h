@@ -584,6 +584,11 @@ void rofd_string_free(rofd_string_t *text);
 /** Return an independently owned immutable snapshot, one entry per Unicode
  * scalar in canonical page text, including synthesized separators. Free with
  * rofd_text_layout_free. The snapshot survives page and document destruction.
+ * A scalar whose run declares no explicit delta is placed by its font's advance,
+ * resolved through the default font stack (the one a renderer created with NULL
+ * options uses); a renderer configured with other fallback families may draw
+ * slightly different advances. Scalars that cannot be resolved fall back to a
+ * conservative font-size box.
  * page and layout are required; error is optional. All outputs must be aligned,
  * writable, mutually disjoint and disjoint from live page storage. */
 rofd_status_t rofd_page_get_text_layout(const rofd_page_t *page,
