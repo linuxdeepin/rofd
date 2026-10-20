@@ -1,11 +1,16 @@
 use std::io::{Cursor, Write};
+use std::sync::Arc;
+
+use fontdb::Database;
 
 use cairo::{
     Antialias, Context, FillRule, FontOptions, Format, HintMetrics, HintStyle, ImageSurface,
     Matrix, Operator, PathSegment, SubpixelOrder,
 };
 use rofd_core::{Document, LoadOptions};
-use rofd_render::{CairoRenderer, Error, PixelRect, RenderOptions};
+use rofd_render::{
+    CairoRenderer, Error, FontTextMetrics, PixelRect, RenderOptions, SystemFontResolver,
+};
 use zip::{write::SimpleFileOptions, ZipWriter};
 
 const FONT: &[u8] = include_bytes!("fixtures/fonts/phase3-subset.ttf");
@@ -150,6 +155,83 @@ fn embedded_latin_and_cjk_glyphs_render_at_positioned_baselines() {
     let mut surface = render(&page, 0);
     let bounds = ink_bounds(&mut surface).expect("controlled glyphs must paint");
     assert_eq!(bounds, (30, 46, 136, 83));
+}
+
+#[test]
+fn semantic_character_boxes_cover_the_rendered_ink() {
+    let content = r#"<ofd:TextObject ID="2" Boundary="2 3 24 12" Font="10" Size="4" Fill="true" Stroke="false"><ofd:FillColor Value="0 0 0"/><ofd:TextCode X="1" Y="5">A中</ofd:TextCode></ofd:TextObject>"#;
+    let mut database = Database::new();
+    database.load_font_data(FONT.to_vec());
+    let resolver: Arc<dyn rofd_render::FontResolver> = Arc::new(SystemFontResolver::from_database(
+        database,
+        Vec::new(),
+        1 << 20,
+    ));
+    let metrics: Arc<dyn rofd_core::TextMetricsProvider> = Arc::new(FontTextMetrics::new(resolver));
+    let page =
+        Document::from_bytes_with_metrics(package(content), LoadOptions::default(), Some(metrics))
+            .unwrap()
+            .page(0)
+            .unwrap();
+
+    let mut surface = render(&page, 0);
+    let (left, top, right, bottom) =
+        ink_bounds(&mut surface).expect("controlled glyphs must paint");
+
+    // 254 dpi renders exactly ten pixels per millimetre.
+    let boxes: Vec<(f64, f64, f64, f64)> = page
+        .text()
+        .unwrap()
+        .characters()
+        .iter()
+        .map(|character| {
+            let rect = character.rect_mm().expect("both glyphs carry geometry");
+            (
+                rect.x * 10.0,
+                rect.y * 10.0,
+                (rect.x + rect.width) * 10.0,
+                (rect.y + rect.height) * 10.0,
+            )
+        })
+        .collect();
+    assert_eq!(boxes.len(), 2);
+    // One band for the whole text object: the boxes of A and 中 share their top and
+    // bottom, because both come from the face's metrics rather than from each glyph's
+    // ink.
+    for index in 1..boxes.len() {
+        assert_eq!(boxes[index].1, boxes[0].1, "tops differ: {boxes:?}");
+        assert_eq!(boxes[index].3, boxes[0].3, "bottoms differ: {boxes:?}");
+    }
+    let box_left = boxes
+        .iter()
+        .map(|box_| box_.0)
+        .fold(f64::INFINITY, f64::min);
+    let box_top = boxes
+        .iter()
+        .map(|box_| box_.1)
+        .fold(f64::INFINITY, f64::min);
+    let box_right = boxes
+        .iter()
+        .map(|box_| box_.2)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let box_bottom = boxes
+        .iter()
+        .map(|box_| box_.3)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    // The band contains the painted ink and sticks out above and below it, the way a
+    // PDF text box built from the same font metrics does.
+    let slack = 1.0;
+    assert!(f64::from(left) >= box_left - slack, "{left} vs {box_left}");
+    assert!(
+        f64::from(right) <= box_right + slack,
+        "{right} vs {box_right}"
+    );
+    assert!(box_top < f64::from(top), "{box_top} vs {top}");
+    assert!(box_bottom > f64::from(bottom), "{box_bottom} vs {bottom}");
+    // 中 paints below the baseline, which is where the font-size footprint stopped:
+    // the band's bottom is below the baseline even without the ink.
+    assert!(box_bottom > 80.0, "{box_bottom} vs the baseline");
 }
 
 #[test]

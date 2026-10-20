@@ -1,6 +1,7 @@
 #[path = "../../rofd-core/tests/support/mod.rs"]
 mod support;
 
+use cairo::{Context, Format, ImageSurface};
 use rofd_ffi::*;
 use std::ffi::{CStr, CString};
 use std::mem::{size_of, MaybeUninit};
@@ -160,6 +161,18 @@ unsafe fn selection_bytes(selection: *const rofd_text_selection_t) -> Vec<u8> {
             .to_bytes()
             .to_vec()
     }
+}
+
+unsafe fn selection_region_count(selection: *const rofd_text_selection_t) -> usize {
+    let mut count = usize::MAX;
+    // SAFETY: The output is valid and distinct from the live immutable selection handle.
+    unsafe {
+        assert_eq!(
+            rofd_text_selection_get_region_count(selection, &mut count, ptr::null_mut()),
+            ROFD_STATUS_OK
+        );
+    }
+    count
 }
 
 unsafe fn selection_region(selection: *const rofd_text_selection_t, index: usize) -> rofd_rect_t {
@@ -1019,5 +1032,192 @@ fn text_geometry_and_search_rectangles_use_font_advances() {
         rofd_text_search_free(search);
         rofd_text_layout_free(layout);
         rofd_page_free(page);
+    }
+}
+
+/// A character box covers the glyph a renderer paints, including the part below the
+/// baseline: the font-size footprint ended exactly at the baseline, so a selection or
+/// search highlight built from the ABI's rectangles was clipped at the bottom of the
+/// text (CJK overshoot and Latin descenders alike).
+#[test]
+fn text_layout_rectangles_cover_the_rendered_ink_below_the_baseline() {
+    const FONT: &[u8] = include_bytes!("../../rofd-render/tests/fixtures/fonts/phase3-subset.ttf");
+    // A stays above the baseline, 中 reaches 0.079 em below it in this subset (Noto
+    // Sans CJK SC): the two boxes still have to span one band.
+    let xml = r#"<ofd:Page xmlns:ofd="http://www.ofdspec.org/2016"><ofd:Content><ofd:Layer ID="1"><ofd:TextObject ID="2" Boundary="0 0 30 10" Font="10" Size="4"><ofd:TextCode X="1" Y="4">A中</ofd:TextCode></ofd:TextObject></ofd:Layer></ofd:Content></ofd:Page>"#;
+    let document = r#"<ofd:Document xmlns:ofd="http://www.ofdspec.org/2016"><ofd:CommonData><ofd:PageArea><ofd:PhysicalBox>0 0 30 10</ofd:PhysicalBox></ofd:PageArea><ofd:DocumentRes>Res.xml</ofd:DocumentRes></ofd:CommonData><ofd:Pages><ofd:Page ID="900" BaseLoc="Pages/Page_0/Content.xml"/></ofd:Pages></ofd:Document>"#;
+    let font = br#"<ofd:Res xmlns:ofd="http://www.ofdspec.org/2016"><ofd:Fonts><ofd:Font ID="10" FontName="Fixture"><ofd:FontFile>Fonts/subset.ttf</ofd:FontFile></ofd:Font></ofd:Fonts></ofd:Res>"#;
+    let bytes = support::ofd_with_document_page_and_entries(
+        document,
+        xml,
+        &[("Doc_0/Res.xml", font), ("Doc_0/Fonts/subset.ttf", FONT)],
+    );
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "rofd-ffi-semantic-ink-{}-{}.ofd",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, bytes).unwrap();
+    let cpath = CString::new(path.to_str().unwrap()).unwrap();
+
+    let mut document_handle = ptr::null_mut();
+    let mut page = ptr::null_mut();
+    let mut renderer = ptr::null_mut();
+    let mut layout = ptr::null_mut();
+    let mut report = ptr::null_mut();
+    // SAFETY: Live handles, initialized records and disjoint outputs; every handle is
+    // freed once after its last borrow.
+    unsafe {
+        assert_eq!(
+            rofd_document_open(
+                cpath.as_ptr(),
+                ptr::null(),
+                &mut document_handle,
+                ptr::null_mut()
+            ),
+            ROFD_STATUS_OK
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            rofd_document_get_page(document_handle, 0, &mut page, ptr::null_mut()),
+            ROFD_STATUS_OK
+        );
+
+        // 254 dpi renders exactly ten pixels per millimetre.
+        let options = rofd_render_options_t {
+            dpi: 254.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            rofd_renderer_new(ptr::null(), &mut renderer, ptr::null_mut()),
+            ROFD_STATUS_OK
+        );
+        let (mut width, mut height) = (0, 0);
+        assert_eq!(
+            rofd_renderer_get_pixel_canvas_size(
+                renderer,
+                page,
+                &options,
+                &mut width,
+                &mut height,
+                ptr::null_mut()
+            ),
+            ROFD_STATUS_OK
+        );
+        let surface = ImageSurface::create(Format::ARgb32, width, height).unwrap();
+        let context = Context::new(&surface).unwrap();
+        assert_eq!(
+            rofd_renderer_render_page_cairo(
+                renderer,
+                page,
+                context.to_raw_none(),
+                &options,
+                &mut report,
+                ptr::null_mut()
+            ),
+            ROFD_STATUS_OK
+        );
+        drop(context);
+
+        assert_eq!(
+            rofd_page_get_text_layout(page, &mut layout, ptr::null_mut()),
+            ROFD_STATUS_OK
+        );
+        let mut count = 0;
+        assert_eq!(
+            rofd_text_layout_get_count(layout, &mut count, ptr::null_mut()),
+            ROFD_STATUS_OK
+        );
+        assert_eq!(count, 2);
+
+        surface.flush();
+        let (mut ink_left, mut ink_top) = (i32::MAX, i32::MAX);
+        let (mut ink_right, mut ink_bottom) = (i32::MIN, i32::MIN);
+        let stride = surface.stride() as usize;
+        surface
+            .with_data(|data| {
+                for y in 0..height {
+                    for x in 0..width {
+                        let offset = y as usize * stride + x as usize * 4;
+                        if data[offset..offset + 3] == [255, 255, 255] {
+                            continue;
+                        }
+                        ink_left = ink_left.min(x);
+                        ink_top = ink_top.min(y);
+                        ink_right = ink_right.max(x);
+                        ink_bottom = ink_bottom.max(y);
+                    }
+                }
+            })
+            .unwrap();
+        assert!(ink_bottom > ink_top, "the embedded glyphs must paint");
+
+        // Both scalars span one band, taken from the face's metrics rather than from
+        // each glyph's own ink, so Latin, CJK and punctuation line up.
+        let a = character(layout, 0).rect_mm;
+        let cjk = character(layout, 1).rect_mm;
+        assert_eq!(a.y_mm, cjk.y_mm);
+        assert_eq!(a.height_mm, cjk.height_mm);
+        let slack = 1.0;
+        let (box_left, box_top) = (a.x_mm * 10.0, a.y_mm * 10.0);
+        let (box_right, box_bottom) = (
+            (cjk.x_mm + cjk.width_mm) * 10.0,
+            (a.y_mm + a.height_mm) * 10.0,
+        );
+
+        // The band is the face's ascent and descent (hhea 1160/-288 over the subset's
+        // 1000-unit em), so it sticks out above and below the ink instead of hugging
+        // it, and its bottom clears the baseline (40 px at ten pixels per millimetre).
+        assert!(box_top < f64::from(ink_top), "top {box_top} vs {ink_top}");
+        assert!(box_bottom > 40.0, "bottom {box_bottom} vs the baseline");
+        assert!(
+            box_bottom > f64::from(ink_bottom),
+            "bottom {box_bottom} vs {ink_bottom}"
+        );
+        assert!(
+            box_left <= f64::from(ink_left) + slack,
+            "left {box_left} vs {ink_left}"
+        );
+        assert!(
+            box_right >= f64::from(ink_right) - slack,
+            "right {box_right} vs {ink_right}"
+        );
+
+        // A line selection over the same text is that band grown by an eighth of its
+        // height on both sides, the margin a PDF selection region has.
+        let area = rofd_rect_t {
+            x_mm: 0.0,
+            y_mm: 0.0,
+            width_mm: 30.0,
+            height_mm: 10.0,
+        };
+        let mut selection = ptr::null_mut();
+        assert_eq!(
+            rofd_page_get_selected_text(
+                page,
+                ROFD_SELECTION_LINE,
+                &area,
+                &mut selection,
+                ptr::null_mut()
+            ),
+            ROFD_STATUS_OK
+        );
+        assert_eq!(selection_region_count(selection), 1);
+        let region = selection_region(selection, 0);
+        let margin = a.height_mm / 8.0;
+        assert!(
+            (region.y_mm - (a.y_mm - margin)).abs() < 1e-3,
+            "region {region:?} vs band {:?} + margin {margin}",
+            a
+        );
+        assert!((region.height_mm - (a.height_mm + 2.0 * margin)).abs() < 1e-3);
+        rofd_text_selection_free(selection);
+
+        rofd_render_report_free(report);
+        rofd_text_layout_free(layout);
+        rofd_renderer_free(renderer);
+        rofd_page_free(page);
+        rofd_document_free(document_handle);
     }
 }

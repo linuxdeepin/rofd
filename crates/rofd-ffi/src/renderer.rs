@@ -16,7 +16,7 @@ use rofd_render::{
 use std::ffi::CStr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
-use std::sync::OnceLock;
+use std::sync::{Arc, LazyLock};
 
 const MAX_FALLBACK_FAMILIES: usize = 1024;
 const DEFAULT_FALLBACK_FAMILIES: [&str; 3] = ["Noto Sans CJK SC", "Noto Sans", "DejaVu Sans"];
@@ -131,23 +131,24 @@ fn default_fallback_families() -> Vec<String> {
         .collect()
 }
 
-/// Font advances for text runs that carry no explicit `DeltaX`.
+/// Font metrics for the semantic page text index.
 ///
-/// Semantic page geometry is resolved with the same font stack a default renderer
-/// uses (`rofd_renderer_new` with NULL options), so the page text layout, search
-/// rectangles and selection regions land on the glyphs that get drawn. The resolver
-/// is created once per process and kept for the life of the library, because the
-/// system font database scan is the expensive part. A renderer created with other
-/// fallback families still chooses its own faces for drawing.
-pub(crate) fn text_advance_provider() -> rofd_render::FontTextAdvances<'static> {
-    static RESOLVER: OnceLock<&'static SystemFontResolver> = OnceLock::new();
-    let resolver = RESOLVER.get_or_init(|| {
-        Box::leak(Box::new(SystemFontResolver::with_system_fonts(
+/// Page text geometry is resolved with the same font stack a default renderer uses
+/// (`rofd_renderer_new` with NULL options), so the page text layout, search
+/// rectangles and selection regions land on the glyphs that get drawn - including the
+/// vertical extent of each glyph, so a highlight covers the text it belongs to. The
+/// resolver is created once per process and shared with every document that resolves
+/// metrics, because the system font database scan is the expensive part. A renderer
+/// created with other fallback families still chooses its own faces for drawing.
+pub(crate) fn text_metrics_provider() -> rofd_render::FontTextMetrics {
+    static RESOLVER: LazyLock<Arc<SystemFontResolver>> = LazyLock::new(|| {
+        Arc::new(SystemFontResolver::with_system_fonts(
             default_fallback_families(),
             64 * 1024 * 1024,
-        )))
+        ))
     });
-    rofd_render::FontTextAdvances::new(*resolver)
+    let resolver: Arc<SystemFontResolver> = Arc::clone(&RESOLVER);
+    rofd_render::FontTextMetrics::new(resolver)
 }
 
 pub(crate) struct RenderOptionsInput;

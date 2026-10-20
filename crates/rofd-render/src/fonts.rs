@@ -5,8 +5,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use fontdb::{Database, Family, Query, Source, ID};
 use freetype::face::LoadFlag;
 use rofd_core::{
-    FontResource, Page, ResourceIdentity, ResourceLimits, TextAdvanceProvider, TextObject,
-    Transform,
+    FontResource, Page, ResourceIdentity, ResourceLimits, TextMetricsProvider, TextObject,
+    TextScalarMetrics, Transform,
 };
 
 use crate::{Error, Result};
@@ -100,6 +100,11 @@ pub struct ResolvedFont {
     family_name: Option<Arc<str>>,
     glyph_count: u32,
     units_per_em: u16,
+    /// Typographic ascender in font units, or zero when the face declares none.
+    ascender: i64,
+    /// Typographic descender in font units (negative below the baseline), or zero
+    /// when the face declares none.
+    descender: i64,
     metrics: Arc<Mutex<FontMetricsCache>>,
 }
 
@@ -243,6 +248,10 @@ impl ResolvedFont {
             });
         }
         let family_name = face.family_name().map(Arc::<str>::from);
+        // The face's own typographic extents, in font units. Everything painted from
+        // this face sits inside them (see `typographic_extents_mm`).
+        let ascender = i64::from(face.ascender());
+        let descender = i64::from(face.descender());
         Ok(Self {
             bytes,
             face_index,
@@ -251,6 +260,8 @@ impl ResolvedFont {
             family_name,
             glyph_count,
             units_per_em,
+            ascender,
+            descender,
             metrics: Arc::new(Mutex::new(FontMetricsCache::default())),
         })
     }
@@ -298,13 +309,8 @@ impl ResolvedFont {
     /// Returns the unshaped horizontal-layout advance at `size_mm`.
     pub fn glyph_advance_mm(&self, glyph_id: u32, size_mm: f64) -> Result<(f64, f64)> {
         validate_glyph(self, glyph_id)?;
-        if !size_mm.is_finite() || size_mm <= 0.0 {
-            return Err(Error::InvalidFont {
-                identity: self.identity().to_owned(),
-                message: "glyph advance size must be finite and positive".to_owned(),
-            });
-        }
-        self.advance_mm(glyph_id, size_mm)
+        self.scaled_metrics(glyph_id, size_mm)
+            .map(|metrics| metrics.advance)
     }
 
     fn glyph_for(&self, character: char) -> Result<Option<u32>> {
@@ -319,35 +325,77 @@ impl ResolvedFont {
         Ok(glyph_id)
     }
 
-    fn advance_mm(&self, glyph_id: u32, size_mm: f64) -> Result<(f64, f64)> {
-        let mut metrics = self.metrics.lock().map_err(|_| Error::FontCache {
-            message: "face metadata lock is poisoned".to_owned(),
-        })?;
-        let advance = if let Some(advance) = metrics.advances.get(&glyph_id) {
-            *advance
-        } else {
-            let advance = self.with_face(|face| {
-                face.load_glyph(glyph_id, LoadFlag::NO_SCALE | LoadFlag::NO_HINTING)
-                    .map_err(|error| Error::InvalidFont {
-                        identity: self.identity().to_owned(),
-                        message: error.to_string(),
-                    })?;
-                let advance = face.glyph().advance();
-                Ok((advance.x, advance.y))
-            })?;
-            metrics.advances.insert(glyph_id, advance);
-            advance
-        };
+    /// Returns the advance and the vertical extents of `glyph_id` at `size_mm`.
+    ///
+    /// The extents are the face's own typographic ascent and descent, so every glyph
+    /// of one face at one size reports the same pair: a character box built from them
+    /// covers the glyph (the extents span everything the face can paint around the
+    /// baseline) and lines up with the boxes of the other glyphs, exactly like the
+    /// font metrics a PDF text box uses. A face that declares no usable metrics keeps
+    /// the font-size footprint above the baseline.
+    fn scaled_metrics(&self, glyph_id: u32, size_mm: f64) -> Result<GlyphMetrics> {
+        if !size_mm.is_finite() || size_mm <= 0.0 {
+            return Err(Error::InvalidFont {
+                identity: self.identity().to_owned(),
+                message: "glyph advance size must be finite and positive".to_owned(),
+            });
+        }
+        let unscaled = self.advance_units(glyph_id)?;
         let scale = size_mm / f64::from(self.units_per_em);
-        let x = advance.0 as f64 * scale;
-        let y = advance.1 as f64 * scale;
-        if !x.is_finite() || !y.is_finite() {
+        let advance = (unscaled.0 as f64 * scale, unscaled.1 as f64 * scale);
+        if !advance.0.is_finite() || !advance.1.is_finite() {
             return Err(Error::InvalidFont {
                 identity: self.identity().to_owned(),
                 message: "glyph advance is non-finite".to_owned(),
             });
         }
-        Ok((x, y))
+        let (ascent, descent) = self.typographic_extents_mm(size_mm);
+        Ok(GlyphMetrics {
+            advance,
+            ascent,
+            descent,
+        })
+    }
+
+    /// Returns the face's typographic extent above and below the baseline at
+    /// `size_mm`, or the font-size footprint when the face declares none.
+    ///
+    /// The pair is identical for every glyph of the face at one size, which is what
+    /// keeps character boxes of different scripts and of punctuation aligned. It is
+    /// the same font metric poppler uses for a PDF text box
+    /// (`TextWord::setInitialBounds`: `yMin = y - ascent`, `yMax = y - descent`).
+    fn typographic_extents_mm(&self, size_mm: f64) -> (f64, f64) {
+        if self.ascender <= 0 || self.descender >= 0 {
+            return (size_mm, 0.0);
+        }
+        let scale = size_mm / f64::from(self.units_per_em);
+        let ascent = self.ascender as f64 * scale;
+        let descent = -(self.descender as f64) * scale;
+        if !ascent.is_finite() || !descent.is_finite() || ascent <= 0.0 || descent < 0.0 {
+            return (size_mm, 0.0);
+        }
+        (ascent, descent)
+    }
+
+    /// Returns the cached unscaled advance of `glyph_id`, loading it on first use.
+    fn advance_units(&self, glyph_id: u32) -> Result<(i64, i64)> {
+        let mut metrics = self.metrics.lock().map_err(|_| Error::FontCache {
+            message: "face metadata lock is poisoned".to_owned(),
+        })?;
+        if let Some(advance) = metrics.advances.get(&glyph_id) {
+            return Ok(*advance);
+        }
+        let advance = self.with_face(|face| {
+            face.load_glyph(glyph_id, LoadFlag::NO_SCALE | LoadFlag::NO_HINTING)
+                .map_err(|error| Error::InvalidFont {
+                    identity: self.identity().to_owned(),
+                    message: error.to_string(),
+                })?;
+            let advance = face.glyph().advance();
+            Ok((advance.x, advance.y))
+        })?;
+        metrics.advances.insert(glyph_id, advance);
+        Ok(advance)
     }
 
     fn with_face<T>(
@@ -410,13 +458,43 @@ pub enum FontDiagnostic {
     },
 }
 
+/// Advance and vertical extents of one positioned glyph, in millimetres.
+///
+/// Every value is relative to the glyph's own pen position, which is the baseline
+/// origin the renderer paints it from. The advance is the glyph's; the extents are
+/// the selected face's typographic ascent and descent, so they are the same for every
+/// glyph the face owns and a box built from them stays aligned across scripts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlyphMetrics {
+    advance: (f64, f64),
+    ascent: f64,
+    descent: f64,
+}
+
+impl GlyphMetrics {
+    /// Returns the advance this glyph contributes on each axis, in millimetres.
+    pub fn advance(&self) -> (f64, f64) {
+        self.advance
+    }
+    /// Returns the selected face's typographic ascent above the baseline, in
+    /// millimetres.
+    pub fn ascent(&self) -> f64 {
+        self.ascent
+    }
+    /// Returns the selected face's typographic descent below the baseline, in
+    /// millimetres.
+    pub fn descent(&self) -> f64 {
+        self.descent
+    }
+}
+
 /// One exact glyph placement in OFD object-space millimetres.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PositionedGlyph {
     glyph_id: u32,
     x: f64,
     y: f64,
-    advance: (f64, f64),
+    metrics: GlyphMetrics,
     character: Option<char>,
     source_range: Range<usize>,
     scalar_index: usize,
@@ -439,14 +517,15 @@ impl PositionedGlyph {
     pub fn y(&self) -> f64 {
         self.y
     }
-    /// Returns the advance this glyph contributes on each axis, in millimetres.
+    /// Returns the advance and vertical extents of this glyph in millimetres.
     ///
-    /// This is the selected face advance, or the font size when no face was
-    /// available. It is what positions the next glyph, so a caller that needs the
-    /// per-scalar geometry of a run without explicit deltas can sum it instead of
-    /// resolving fonts again.
-    pub fn advance(&self) -> (f64, f64) {
-        self.advance
+    /// The advance is the selected face advance, or the font size when no face was
+    /// available; it is what positions the next glyph, so a caller that needs the
+    /// per-scalar geometry of a run can sum it instead of resolving fonts again. The
+    /// extents are the selected face's typographic metrics, so a caller can size a
+    /// character box that covers the glyph and matches its neighbours.
+    pub fn metrics(&self) -> GlyphMetrics {
+        self.metrics
     }
     /// Returns the associated source scalar, or `None` for an extra mapped glyph.
     pub fn character(&self) -> Option<char> {
@@ -1124,12 +1203,12 @@ pub fn position_glyph_runs(
                         let (offset_x, offset_y) = glyph_transform
                             .map(|t| (t.x(), t.y()))
                             .unwrap_or((0.0, 0.0));
-                        let advance = selected.advance_mm(glyph_id, text.font_size())?;
+                        let metrics = selected.scaled_metrics(glyph_id, text.font_size())?;
                         glyphs.push(PositionedGlyph {
                             glyph_id,
                             x: finite_coordinate(text, "glyph x", x + inferred_x + offset_x)?,
                             y: finite_coordinate(text, "glyph y", y + inferred_y + offset_y)?,
-                            advance,
+                            metrics,
                             character,
                             source_range: start_byte..end_byte,
                             scalar_index,
@@ -1138,8 +1217,10 @@ pub fn position_glyph_runs(
                             font_source: selected.source().clone(),
                             transform: glyph_transform.and_then(|t| t.matrix()),
                         });
-                        inferred_x = finite_coordinate(text, "advance x", inferred_x + advance.0)?;
-                        inferred_y = finite_coordinate(text, "advance y", inferred_y + advance.1)?;
+                        inferred_x =
+                            finite_coordinate(text, "advance x", inferred_x + metrics.advance.0)?;
+                        inferred_y =
+                            finite_coordinate(text, "advance y", inferred_y + metrics.advance.1)?;
                     }
                     let delta_x = if run.has_explicit_delta_x() {
                         run.delta_x()[local..end_local].iter().sum()
@@ -1197,17 +1278,21 @@ pub fn position_glyph_runs(
                 &requested,
                 &mut diagnostics,
             )?;
-            let advance = selection
+            let metrics = selection
                 .font
                 .as_ref()
-                .map(|font| font.advance_mm(selection.glyph_id, text.font_size()))
+                .map(|font| font.scaled_metrics(selection.glyph_id, text.font_size()))
                 .transpose()?
-                .unwrap_or((text.font_size(), 0.0));
+                .unwrap_or(GlyphMetrics {
+                    advance: (text.font_size(), 0.0),
+                    ascent: text.font_size(),
+                    descent: 0.0,
+                });
             glyphs.push(PositionedGlyph {
                 glyph_id: selection.glyph_id,
                 x: finite_coordinate(text, "glyph x", x)?,
                 y: finite_coordinate(text, "glyph y", y)?,
-                advance,
+                metrics,
                 character: Some(character),
                 source_range: byte_start..byte_end,
                 scalar_index,
@@ -1219,12 +1304,12 @@ pub fn position_glyph_runs(
             let delta_x = if run.has_explicit_delta_x() {
                 run.delta_x()[local]
             } else {
-                advance.0
+                metrics.advance.0
             };
             let delta_y = if run.has_explicit_delta_y() {
                 run.delta_y()[local]
             } else {
-                advance.1
+                metrics.advance.1
             };
             x = finite_coordinate(text, "glyph x", x + delta_x)?;
             y = finite_coordinate(text, "glyph y", y + delta_y)?;
@@ -1244,49 +1329,76 @@ pub fn position_glyph_runs(
     Ok(runs)
 }
 
-/// Per-scalar advances from the same font resolution the renderer positions text with.
+/// Per-scalar metrics from the same font resolution the renderer positions text with.
 ///
-/// This is the [`TextAdvanceProvider`] rofd-core asks for when a text run carries no
-/// explicit `DeltaX`: the answer is the advance of the glyph the positioner selected,
-/// summed per scalar for structured `Glyphs` mappings, so page geometry matches the
-/// rendered glyphs. Resolution failures answer `None`, which keeps rofd-core's
-/// font-size footprint.
-#[derive(Clone, Copy)]
-pub struct FontTextAdvances<'a> {
-    resolver: &'a dyn FontResolver,
+/// This is the [`TextMetricsProvider`] rofd-core asks for: the answer is the advance
+/// of the glyph the positioner selected, summed per scalar for structured `Glyphs`
+/// mappings, and that glyph's painted extents around the baseline, so a character box
+/// covers the glyph a renderer draws. Resolution failures answer `None`, which keeps
+/// rofd-core's font-size footprint.
+#[derive(Clone)]
+pub struct FontTextMetrics {
+    resolver: Arc<dyn FontResolver>,
 }
 
-impl<'a> FontTextAdvances<'a> {
+impl FontTextMetrics {
     /// Wraps the resolver a renderer would use for the same page.
-    pub fn new(resolver: &'a dyn FontResolver) -> Self {
+    ///
+    /// The provider owns the shared resolver, because a document holds it for its
+    /// whole life and page text is built lazily on later queries.
+    pub fn new(resolver: Arc<dyn FontResolver>) -> Self {
         Self { resolver }
     }
 }
 
-impl TextAdvanceProvider for FontTextAdvances<'_> {
-    fn advances_mm(&self, page: &Page, text: &TextObject, size_mm: f64) -> Option<Vec<f64>> {
+impl TextMetricsProvider for FontTextMetrics {
+    fn metrics_mm(
+        &self,
+        page: &Page,
+        text: &TextObject,
+        size_mm: f64,
+    ) -> Option<Vec<TextScalarMetrics>> {
         let resource = page.font_resource(text.font_id()).ok()?;
-        let runs =
-            position_glyph_runs(self.resolver, &resource, text, page.resource_limits()).ok()?;
+        let runs = position_glyph_runs(
+            self.resolver.as_ref(),
+            &resource,
+            text,
+            page.resource_limits(),
+        )
+        .ok()?;
         let total = text.runs().iter().try_fold(0usize, |total, run| {
             total.checked_add(run.text().chars().count())
         })?;
         // Glyphs of one structured mapping share the scalar index of the mapped
         // range, so their advances sum there, exactly as the positioner advances the
-        // mapped run. A scalar without a glyph keeps the size footprint the builder
-        // uses on its own.
-        let mut advances: Vec<Option<f64>> = vec![None; total];
+        // mapped run, and their extents widen it, because the box has to cover every
+        // glyph painted for that scalar. A scalar without a glyph keeps the size
+        // footprint the builder uses on its own.
+        let mut resolved: Vec<Option<TextScalarMetrics>> = vec![None; total];
         for run in &runs {
             for glyph in run.glyphs() {
-                let slot = advances.get_mut(glyph.scalar_index())?;
-                let (x, _) = glyph.advance();
-                *slot = Some(slot.unwrap_or(0.0) + x);
+                let metrics = glyph.metrics();
+                let slot = resolved.get_mut(glyph.scalar_index())?;
+                let entry = slot.get_or_insert(TextScalarMetrics {
+                    advance_mm: 0.0,
+                    ascent_mm: 0.0,
+                    descent_mm: 0.0,
+                });
+                entry.advance_mm += metrics.advance().0;
+                entry.ascent_mm = entry.ascent_mm.max(metrics.ascent());
+                entry.descent_mm = entry.descent_mm.max(metrics.descent());
             }
         }
         Some(
-            advances
+            resolved
                 .into_iter()
-                .map(|advance| advance.unwrap_or(size_mm))
+                .map(|entry| {
+                    entry.unwrap_or(TextScalarMetrics {
+                        advance_mm: size_mm,
+                        ascent_mm: size_mm,
+                        descent_mm: 0.0,
+                    })
+                })
                 .collect(),
         )
     }

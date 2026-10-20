@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 
 use fontdb::Database;
-use rofd_core::{Document, LoadOptions, PageObject, ResourceLimits, TextAdvanceProvider};
+use rofd_core::{Document, LoadOptions, PageObject, ResourceLimits, TextMetricsProvider};
 use rofd_render::{
     position_glyph_runs, Error, FontDiagnostic, FontIdentity, FontResolver, FontSource,
     ResolvedFont, SystemFontResolver,
@@ -854,16 +854,18 @@ fn equal_resource_ids_from_distinct_documents_do_not_share_cache_entries() {
     );
 }
 
-/// The provider rofd-core asks for must answer exactly the advances the positioner
-/// used, so page geometry lands on the glyphs a renderer draws.
+/// The provider rofd-core asks for must answer exactly the geometry the positioner
+/// used, so page character boxes land on the glyphs a renderer draws - horizontally
+/// on their advance and vertically on their painted extents.
 #[test]
-fn font_text_advances_match_the_positioner_and_follow_font_metrics() {
+fn font_text_metrics_match_the_positioner_and_follow_font_metrics() {
     // A, B and Z carry proportional advances in the fixture subset; most other
     // Latin scalars map to a full-width face advance equal to the font size, which
-    // would not distinguish metrics from the size-based fallback.
+    // would not distinguish metrics from the size-based fallback. 中 adds a CJK glyph
+    // whose ink reaches below the baseline.
     let document = package_named(
-        Some(LATIN_FONT),
-        r#"<ofd:TextCode X="0" Y="4">ABZ</ofd:TextCode>"#,
+        Some(FONT),
+        r#"<ofd:TextCode X="0" Y="4">ABZ中</ofd:TextCode>"#,
         "",
         "Fixture",
     );
@@ -871,13 +873,13 @@ fn font_text_advances_match_the_positioner_and_follow_font_metrics() {
     let page = document.page(0).unwrap();
     let resource = document.font_resource(text.font_id()).unwrap();
     let mut database = Database::new();
-    database.load_font_data(LATIN_FONT.to_vec());
+    database.load_font_data(FONT.to_vec());
     let resolver = SystemFontResolver::from_database(database, Vec::new(), 1 << 20);
 
     let runs = position_glyph_runs(&resolver, &resource, &text, page.resource_limits()).unwrap();
-    let provider = rofd_render::FontTextAdvances::new(&resolver);
-    let advances = provider
-        .advances_mm(&page, &text, text.font_size())
+    let provider = rofd_render::FontTextMetrics::new(Arc::new(resolver));
+    let metrics = provider
+        .metrics_mm(&page, &text, text.font_size())
         .expect("embedded font resolves");
 
     assert!(
@@ -886,29 +888,58 @@ fn font_text_advances_match_the_positioner_and_follow_font_metrics() {
         runs[0].diagnostics()
     );
 
-    // One advance per scalar, equal to the advance of the glyph that owns it.
-    let positioned: Vec<f64> = runs
+    // One entry per scalar, equal to the metrics of the glyph that owns it.
+    let positioned: Vec<rofd_render::GlyphMetrics> = runs
         .iter()
         .flat_map(|run| run.glyphs())
-        .map(|glyph| glyph.advance().0)
+        .map(|glyph| glyph.metrics())
         .collect();
-    assert_eq!(advances.len(), positioned.len());
-    assert_eq!(advances.len(), 3);
-    for (index, advance) in advances.iter().enumerate() {
+    let advances: Vec<f64> = metrics.iter().map(|metrics| metrics.advance_mm).collect();
+    assert_eq!(metrics.len(), positioned.len());
+    assert_eq!(metrics.len(), 4);
+    for (index, entry) in metrics.iter().enumerate() {
         assert!(
-            (advance - positioned[index]).abs() < 1e-9,
-            "scalar {index}: provider {advance} vs positioner {}",
-            positioned[index]
+            (entry.advance_mm - positioned[index].advance().0).abs() < 1e-9,
+            "scalar {index}: provider {} vs positioner {}",
+            entry.advance_mm,
+            positioned[index].advance().0
         );
+        assert_eq!(entry.ascent_mm, positioned[index].ascent(), "{index}");
+        assert_eq!(entry.descent_mm, positioned[index].descent(), "{index}");
     }
 
-    // Font metrics, not a uniform font-size footprint.
+    // Font metrics, not a uniform font-size footprint: the Latin scalars are narrower
+    // than the size, while the full-width 中 fills its em.
     assert!(advances[0] < advances[1], "{advances:?}");
-    assert!(advances.iter().all(|advance| *advance < text.font_size()));
+    assert!(
+        (advances[3] - text.font_size()).abs() < 1e-9,
+        "{advances:?}"
+    );
+    assert!(advances[..3]
+        .iter()
+        .all(|advance| *advance < text.font_size()));
     assert!(advances.iter().all(|advance| *advance > 0.0));
+
+    // The vertical extents come from the face's own metrics (hhea 1160/-288 over the
+    // subset's 1000-unit em), scaled to Size: every glyph reports the same pair, which
+    // is what keeps the boxes of Latin, CJK and punctuation aligned.
+    let size = text.font_size();
+    let per_em = |units: f64| units / 1000.0 * size;
+    for entry in &metrics {
+        assert!(
+            (entry.ascent_mm - per_em(1160.0)).abs() < 1e-6,
+            "{metrics:?}"
+        );
+        assert!(
+            (entry.descent_mm - per_em(288.0)).abs() < 1e-6,
+            "{metrics:?}"
+        );
+    }
+    // 中 paints below the baseline and A does not, yet both boxes span the same band.
+    assert!(metrics[3].descent_mm > 0.0);
 
     // Both layers agree on where the run ends.
     let semantic_end: f64 = advances.iter().sum();
-    let positioned_end: f64 = positioned.iter().sum();
+    let positioned_end: f64 = positioned.iter().map(|metrics| metrics.advance().0).sum();
     assert!((semantic_end - positioned_end).abs() < 1e-9);
 }

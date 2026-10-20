@@ -90,12 +90,14 @@ Where OFD data cannot yield an exact glyph box, the API returns a conservative
 finite character box and records its precision in flags instead of pretending
 font-derived accuracy.
 
-A run that declares no delta for a scalar is positioned by its font's advance, so
-the core builder accepts an optional `TextAdvanceProvider` that answers those
-advances without pulling fonts into the core crate: `rofd-render` implements it
-over the same font resolution the renderer positions text with, and `rofd-ffi`
-loads documents with the default font stack so the ABI's rectangles land on the
-glyphs a default renderer draws. Without a provider the builder keeps the
+A run that declares no delta for a scalar is positioned by its font's advance, and
+the glyph is painted at that font's extent around the baseline, so the core builder
+accepts an optional `TextMetricsProvider` that answers both without pulling fonts
+into the core crate: `rofd-render` implements it over the same font resolution the
+renderer positions text with, and `rofd-ffi` loads documents with the default font
+stack so the ABI's rectangles land on the glyphs a default renderer draws - covered
+horizontally by the advance and vertically by the painted ascent and descent, which
+is what a highlight or caret needs. Without a provider the builder keeps the
 font-size footprint, and scalars it cannot resolve stay flagged as conservative.
 
 Reading order is deterministic. It starts with effective paint/source order,

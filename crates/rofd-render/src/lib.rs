@@ -19,8 +19,8 @@ pub use display_list::{
     ClipPath, Command, DisplayList, DisplayListBuilder, RenderDiagnostic, RenderDiagnosticKind,
 };
 pub use fonts::{
-    position_glyph_runs, FontDiagnostic, FontIdentity, FontResolver, FontSource, FontTextAdvances,
-    GlyphRun, PositionedGlyph, ResolvedFont, SystemFontResolver,
+    position_glyph_runs, FontDiagnostic, FontIdentity, FontResolver, FontSource, FontTextMetrics,
+    GlyphMetrics, GlyphRun, PositionedGlyph, ResolvedFont, SystemFontResolver,
 };
 pub use images::{DecodedImage, ImageDecoder};
 

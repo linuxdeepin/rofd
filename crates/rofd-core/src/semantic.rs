@@ -2,22 +2,46 @@ use std::ops::Range;
 
 use crate::{Error, Page, PageObject, Point, Rect, Result, TextObject, Transform};
 
-/// Supplies the horizontal advance of one scalar when a text run declares no
-/// `DeltaX` for it.
+/// Font-resolved geometry of one scalar of a text object, in millimetres.
 ///
-/// The OFD text model positions such a scalar by its font's advance, so geometry
-/// that resolves fonts matches what a renderer draws; this crate parses and indexes
-/// text without font access, which is why a provider is injected from outside
-/// (`rofd-render` implements it over the same font stack the renderer uses). A
-/// document loaded without a provider keeps the font-size footprint for those runs,
-/// which stays a valid conservative approximation.
-pub trait TextAdvanceProvider: Send + Sync {
-    /// Returns one advance in millimetres per scalar of `text`, concatenating its
-    /// runs in order, or `None` when the object's font cannot be resolved (the
+/// Every value is relative to the scalar's pen position, which is the baseline
+/// origin the OFD text model positions and a renderer paints from. The advance is the
+/// glyph's; the extents are its face's typographic ascent and descent, so the scalars
+/// of one face at one size share them and the boxes of different scripts and of
+/// punctuation stay aligned, the way a PDF text box built from font metrics does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextScalarMetrics {
+    /// Horizontal advance the pen moves by after the scalar is painted.
+    pub advance_mm: f64,
+    /// Extent the face declares above the baseline.
+    pub ascent_mm: f64,
+    /// Extent the face declares below the baseline.
+    pub descent_mm: f64,
+}
+
+/// Supplies the font-resolved geometry of each scalar of one text object.
+///
+/// A scalar without an explicit `DeltaX` is positioned by its font's advance, and it
+/// is painted at the font's own extent around the baseline; this crate parses and
+/// indexes text without font access, which is why a provider is injected from outside
+/// (`rofd-render` implements it over the same font stack the renderer uses) whenever
+/// page geometry has to match what a renderer draws. A document loaded without a
+/// provider keeps the font-size footprint, which stays a valid conservative
+/// approximation.
+pub trait TextMetricsProvider: Send + Sync {
+    /// Returns one metrics entry in millimetres per scalar of `text`, concatenating
+    /// its runs in order, or `None` when the object's font cannot be resolved (the
     /// builder then keeps the font-size footprint).
     ///
-    /// Non-finite or negative values are ignored per scalar.
-    fn advances_mm(&self, page: &Page, text: &TextObject, size_mm: f64) -> Option<Vec<f64>>;
+    /// A scalar without a resolved glyph of its own keeps the conservative font-size
+    /// footprint: `size_mm` above the baseline and nothing below it. That covers both
+    /// a scalar no face owns and one whose glyph paints nothing, such as a space.
+    fn metrics_mm(
+        &self,
+        page: &Page,
+        text: &TextObject,
+        size_mm: f64,
+    ) -> Option<Vec<TextScalarMetrics>>;
 }
 
 /// Options for literal search in canonical page text.
@@ -85,7 +109,8 @@ impl TextSelection {
         &self.text
     }
 
-    /// Returns one union of selected visible boxes per participating logical line.
+    /// Returns one union of selected visible boxes per participating logical line,
+    /// each grown by the highlight margin a PDF selection region has.
     pub fn regions(&self) -> &[Rect] {
         &self.regions
     }
@@ -334,7 +359,9 @@ impl PageText {
     /// Glyph and word selections emit selected source scalars without synthesized
     /// separators. Line selections retain a synthesized newline only when both
     /// adjacent lines are selected. Regions are ordered by canonical text, with
-    /// one union per selected logical line, never across synthesized separators.
+    /// one union per selected logical line, never across synthesized separators. Each
+    /// union carries the highlight margin a PDF reader's selection region has: it is
+    /// grown by an eighth of its height above and below.
     pub fn select(&self, area: Rect, style: SelectionStyle) -> Result<TextSelection> {
         validate_area(area)?;
         let mut selected = self
@@ -364,7 +391,7 @@ impl PageText {
         for (index, character) in self.characters.iter().enumerate() {
             if self.is_separator(index) {
                 if let Some(rect) = region.take() {
-                    selection.regions.push(rect);
+                    selection.regions.push(selection_region(rect)?);
                 }
                 if style == SelectionStyle::Line
                     && index.checked_sub(1).is_some_and(|before| selected[before])
@@ -385,7 +412,7 @@ impl PageText {
             }
         }
         if let Some(rect) = region {
-            selection.regions.push(rect);
+            selection.regions.push(selection_region(rect)?);
         }
         Ok(selection)
     }
@@ -403,6 +430,23 @@ impl PageText {
             .flags
             .contains(TextCharFlags::SYNTHESIZED_SEPARATOR)
     }
+}
+
+/// Returns the rectangle a selection highlight paints for one selected line.
+///
+/// A PDF reader grows the line band by an eighth of its height above and below
+/// (poppler's `TextSelectionSizer::visitLine`: `margin = (yMax - yMin) / 8`), which is
+/// what makes a selected line read as one band that clears the glyphs instead of
+/// ending on them. Selection regions mirror that growth; character boxes and match
+/// rectangles stay the plain band.
+fn selection_region(rect: Rect) -> Result<Rect> {
+    let margin = rect.height / 8.0;
+    Ok(Rect {
+        x: rect.x,
+        y: finite_add(rect.y, -margin)?,
+        width: rect.width,
+        height: finite_add(rect.height, 2.0 * margin)?,
+    })
 }
 
 fn expand_selected_group(selected: &mut [bool]) {
@@ -482,9 +526,9 @@ fn union_rectangles(mut rectangles: impl Iterator<Item = Rect>) -> Result<Option
 
 pub(crate) fn build_page_text(
     page: &crate::Page,
-    advances: Option<&dyn TextAdvanceProvider>,
+    metrics: Option<&dyn TextMetricsProvider>,
 ) -> Result<PageText> {
-    let mut builder = TextBuilder::new(page, advances);
+    let mut builder = TextBuilder::new(page, metrics);
     for layer in page.layers() {
         builder.objects(layer.objects(), Transform::IDENTITY)?;
     }
@@ -499,7 +543,7 @@ pub(crate) fn build_page_text(
 struct TextBuilder<'a> {
     text: PageText,
     page: &'a Page,
-    advances: Option<&'a dyn TextAdvanceProvider>,
+    metrics: Option<&'a dyn TextMetricsProvider>,
     source_characters: usize,
     metadata_entries: usize,
     max_source_characters: usize,
@@ -507,12 +551,12 @@ struct TextBuilder<'a> {
 }
 
 impl<'a> TextBuilder<'a> {
-    fn new(page: &'a Page, advances: Option<&'a dyn TextAdvanceProvider>) -> Self {
+    fn new(page: &'a Page, metrics: Option<&'a dyn TextMetricsProvider>) -> Self {
         let limits = page.resource_limits();
         Self {
             text: PageText::default(),
             page,
-            advances,
+            metrics,
             source_characters: 0,
             metadata_entries: 0,
             max_source_characters: limits.max_text_characters_per_page,
@@ -552,27 +596,35 @@ impl<'a> TextBuilder<'a> {
             self.push_separator()?;
         }
         let size = object.font_size();
-        // One font-resolved advance per scalar of the whole object, in run order;
-        // absent when the provider has no font for it. Explicit deltas stay
-        // authoritative and are never replaced, and they are the only thing this
-        // geometry takes from the provider, so an object whose runs all declare their
-        // own deltas never asks it for a font at all.
-        let needs_advances = object.runs().iter().any(|run| !run.has_explicit_delta_x());
-        let resolved = if needs_advances {
-            self.advances
-                .and_then(|advances| advances.advances_mm(self.page, object, size))
-        } else {
-            None
-        };
+        // One metrics entry per scalar of the whole object, in run order; absent
+        // when the provider has no font for it. Explicit deltas stay authoritative
+        // and are never replaced, but a scalar takes its vertical extents from the
+        // resolved font whatever it declares, so the provider is asked for every
+        // object.
+        let resolved = self
+            .metrics
+            .and_then(|metrics| metrics.metrics_mm(self.page, object, size));
         let mut scalar = 0usize;
         for run in object.runs() {
             let (mut x, mut y) = (run.x(), run.y());
             for (index, character) in run.text().chars().enumerate() {
-                let font_advance = resolved
+                let metrics = resolved
                     .as_ref()
                     .and_then(|values| values.get(scalar))
-                    .copied()
+                    .copied();
+                let font_advance = metrics
+                    .map(|metrics| metrics.advance_mm)
                     .filter(|value| value.is_finite() && *value > 0.0);
+                // A glyph that paints nothing (a space) or that no face owns keeps
+                // the conservative font-size footprint above the baseline.
+                let ascent = metrics
+                    .map(|metrics| metrics.ascent_mm)
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .unwrap_or(size);
+                let descent = metrics
+                    .map(|metrics| metrics.descent_mm)
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .unwrap_or(0.0);
                 let dx = if run.has_explicit_delta_x() {
                     run.delta_x()[index]
                 } else {
@@ -587,7 +639,9 @@ impl<'a> TextBuilder<'a> {
                 let next_x = finite_add(x, dx)?;
                 let next_y = finite_add(y, dy)?;
                 // A resolved glyph advance is the box width, so the boxes of a run
-                // tile it and a match rectangle hugs the matched text. Without one,
+                // tile it and a match rectangle hugs the matched text. Its ascent and
+                // descent are the vertical extents, so the box covers the painted
+                // glyph instead of stopping at the baseline. Without resolved metrics,
                 // bound the horizontal baseline sweep with a direction-independent
                 // font-size footprint instead; explicit zero advances still receive
                 // nonempty conservative geometry.
@@ -596,8 +650,8 @@ impl<'a> TextBuilder<'a> {
                     left,
                     font_advance.map_or_else(|| dx.abs().max(size), f64::abs),
                 )?;
-                let top = finite_add(y.min(next_y), -size)?;
-                let bottom = y.max(next_y);
+                let top = finite_add(y.min(next_y), -ascent)?;
+                let bottom = finite_add(y.max(next_y), descent)?;
                 let rect = transformed_box(left, top, right, bottom, transform)?;
                 let flags = if character.is_whitespace() {
                     TextCharFlags::WHITESPACE

@@ -123,18 +123,18 @@ struct DocumentInner {
     bookmarks: OnceLock<crate::navigation::BookmarkData>,
     bookmark_initialization: Mutex<()>,
     navigation_warning_state: Mutex<NavigationWarningState>,
-    /// Font-resolved per-scalar advances for runs without explicit deltas, when the
-    /// loader supplied a provider (see [`crate::TextAdvanceProvider`]).
-    text_advances: Option<TextAdvances>,
+    /// Font-resolved per-scalar geometry for the page text index, when the loader
+    /// supplied a provider (see [`crate::TextMetricsProvider`]).
+    text_metrics: Option<TextMetricsSource>,
 }
 
-/// Debug-friendly owner of the optional text advance provider.
+/// Debug-friendly owner of the optional text metrics provider.
 #[derive(Clone)]
-struct TextAdvances(Arc<dyn crate::TextAdvanceProvider>);
+struct TextMetricsSource(Arc<dyn crate::TextMetricsProvider>);
 
-impl std::fmt::Debug for TextAdvances {
+impl std::fmt::Debug for TextMetricsSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("TextAdvances(<provider>)")
+        formatter.write_str("TextMetricsSource(<provider>)")
     }
 }
 
@@ -242,15 +242,17 @@ impl Page {
         &self.data.layers
     }
 
-    /// Returns flattened source text and conservative character geometry in
-    /// physical-page millimetres, in effective paint order.
+    /// Returns flattened source text and per-character geometry in physical-page
+    /// millimetres, in effective paint order.
     ///
     /// Visible annotation appearances follow the page layers. Distinct nonempty
-    /// text objects are separated by synthesized newlines. Geometry uses validated
-    /// OFD positioning; a scalar whose run declares no `DeltaX` uses the advance of a
-    /// provider's font when the document was loaded with one, and the font size
-    /// otherwise. The complete result is cached and shared by cloned page handles.
-    /// Failed builds are not cached and may be retried on a later call.
+    /// text objects are separated by synthesized newlines. Geometry uses validated OFD
+    /// positioning; a scalar whose run declares no `DeltaX` advances by the advance of
+    /// a provider's font when the document was loaded with one, and its box spans that
+    /// font's ascent and descent around the baseline, so it covers the painted glyph.
+    /// Without a provider the font-size footprint stays in place. The complete result
+    /// is cached and shared by cloned page handles. Failed builds are not cached and
+    /// may be retried on a later call.
     pub fn text(&self) -> crate::Result<&crate::PageText> {
         if let Some(text) = self.data.semantic_text.get() {
             return Ok(text);
@@ -261,12 +263,12 @@ impl Page {
         if let Some(text) = self.data.semantic_text.get() {
             return Ok(text);
         }
-        let advances = self
+        let metrics = self
             ._document
-            .text_advances
+            .text_metrics
             .as_ref()
-            .map(|advances| advances.0.as_ref() as &dyn crate::TextAdvanceProvider);
-        let text = crate::semantic::build_page_text(self, advances)?;
+            .map(|metrics| metrics.0.as_ref() as &dyn crate::TextMetricsProvider);
+        let text = crate::semantic::build_page_text(self, metrics)?;
         Ok(self.data.semantic_text.get_or_init(|| text))
     }
 
@@ -358,39 +360,40 @@ impl Page {
 impl Document {
     /// Opens an OFD document from a host file path.
     pub fn open(path: impl AsRef<Path>, options: LoadOptions) -> Result<Self> {
-        Self::open_with_advances(path, options, None)
+        Self::open_with_metrics(path, options, None)
     }
 
-    /// Opens an OFD document from a host file path, resolving text advances through
-    /// `advances`.
-    pub fn open_with_advances(
+    /// Opens an OFD document from a host file path, resolving per-scalar text
+    /// geometry through `metrics`.
+    pub fn open_with_metrics(
         path: impl AsRef<Path>,
         options: LoadOptions,
-        advances: Option<Arc<dyn crate::TextAdvanceProvider>>,
+        metrics: Option<Arc<dyn crate::TextMetricsProvider>>,
     ) -> Result<Self> {
         let path = path.as_ref();
         let bytes = fs::read(path).map_err(|source| Error::Io {
             path: path.to_owned(),
             source,
         })?;
-        Self::from_bytes_with_advances(bytes, options, advances)
+        Self::from_bytes_with_metrics(bytes, options, metrics)
     }
 
     /// Opens an OFD document from owned bytes.
     pub fn from_bytes(bytes: Vec<u8>, options: LoadOptions) -> Result<Self> {
-        Self::from_bytes_with_advances(bytes, options, None)
+        Self::from_bytes_with_metrics(bytes, options, None)
     }
 
-    /// Opens an OFD document from owned bytes, resolving text advances through
-    /// `advances`.
+    /// Opens an OFD document from owned bytes, resolving per-scalar text geometry
+    /// through `metrics`.
     ///
-    /// Without a provider, runs that carry no explicit `DeltaX` keep the font-size
-    /// footprint; with one they use the font's advances, which is what a renderer
-    /// draws.
-    pub fn from_bytes_with_advances(
+    /// Without a provider, text geometry keeps the font-size footprint. With one, a
+    /// scalar whose run declares no `DeltaX` advances by the font's advance and its
+    /// box spans the font's extent around the baseline, which is what a renderer
+    /// paints.
+    pub fn from_bytes_with_metrics(
         bytes: Vec<u8>,
         options: LoadOptions,
-        advances: Option<Arc<dyn crate::TextAdvanceProvider>>,
+        metrics: Option<Arc<dyn crate::TextMetricsProvider>>,
     ) -> Result<Self> {
         let strictness = options.strictness;
         let limits = options.limits;
@@ -534,7 +537,7 @@ impl Document {
             container,
             document_path,
             limits,
-            text_advances: advances.map(TextAdvances),
+            text_metrics: metrics.map(TextMetricsSource),
             metadata: Metadata {
                 document_id: info.document_id,
                 title: info.title,
