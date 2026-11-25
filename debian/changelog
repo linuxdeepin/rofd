@@ -1,3 +1,15 @@
+rofd (0.4.4) unstable; urgency=medium
+
+  * chore: Update version to 0.4.4
+  * feat(core): size a resolved glyph box by its advance, not the font size
+  * feat(core): resolve missing text deltas through font advances
+  * feat(debian): install rofd-ffi.pc in librofd-ffi-dev
+  * fix(ffi): bound the region pixel diff by share and delta, not absolute counts
+  * fix(render): budget decoder intermediates on top of the decoded image
+  * feat(ffi): add rofd_document_get_page_size_mm
+
+ -- zhanghongyuan <zhanghongyuan@uniontech.com>  Wed, 25 Nov 2026 10:19:43 +0800
+
 rofd (0.4.3) unstable; urgency=medium
 
   * chore: Update version to 0.4.3
